@@ -211,6 +211,25 @@ export async function finalizeEarningsWithdrawal(
 }
 
 /**
+ * Find owner addresses with earnings stuck in 'pending' withdrawal status
+ * for more than the given number of minutes.
+ * Used by the orphaned redemption recovery worker.
+ */
+export async function findStuckPendingEarningsAddresses(
+  db: Kysely<Database>,
+  olderThanMinutes: number,
+): Promise<string[]> {
+  const rows = await sql<{ owner_address: string }>`
+    SELECT DISTINCT owner_address
+    FROM earnings
+    WHERE withdrawal_status = 'pending'
+      AND withdrawn_at < NOW() - MAKE_INTERVAL(mins => ${olderThanMinutes})
+  `.execute(db);
+
+  return rows.rows.map((r) => r.owner_address);
+}
+
+/**
  * Roll back a pending earnings withdrawal (e.g. the on-chain refund failed).
  * Moves `pending` earnings back to `available` and clears withdrawal metadata.
  */

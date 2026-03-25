@@ -92,6 +92,27 @@ export async function updateRefundStatus(
 }
 
 /**
+ * Recover refunds stuck in 'pending' status without a tx_hash for > 10 minutes.
+ * Marks them as 'failed' with an auto-recovery message.
+ * Returns the number of rows recovered.
+ */
+export async function recoverStuckRefunds(
+  db: Kysely<Database>,
+): Promise<number> {
+  const result = await sql`
+    UPDATE refunds
+    SET status = 'failed',
+        error_message = 'stuck in pending - auto-recovered',
+        completed_at = NOW()
+    WHERE status = 'pending'
+      AND refund_tx_hash IS NULL
+      AND created_at < NOW() - INTERVAL '10 minutes'
+  `.execute(db);
+
+  return Number(result.numAffectedRows ?? 0);
+}
+
+/**
  * Retrieve a successful or pending refund by its source transaction hash.
  * Used for idempotency: if a refund already exists for this source tx, skip
  * re-sending.

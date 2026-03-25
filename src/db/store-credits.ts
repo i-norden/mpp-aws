@@ -136,6 +136,25 @@ export async function finalizeRedemption(
 }
 
 /**
+ * Find payer addresses with credits stuck in 'pending' withdrawal status
+ * for more than the given number of minutes.
+ * Used by the orphaned redemption recovery worker.
+ */
+export async function findStuckPendingCreditAddresses(
+  db: Kysely<Database>,
+  olderThanMinutes: number,
+): Promise<string[]> {
+  const rows = await sql<{ payer_address: string }>`
+    SELECT DISTINCT payer_address
+    FROM credits
+    WHERE withdrawal_status = 'pending'
+      AND redeemed_at < NOW() - MAKE_INTERVAL(mins => ${olderThanMinutes})
+  `.execute(db);
+
+  return rows.rows.map((r) => r.payer_address);
+}
+
+/**
  * Roll back a pending credit redemption (e.g. the on-chain refund failed).
  * Moves `pending` credits back to `available` and clears redemption metadata.
  */
