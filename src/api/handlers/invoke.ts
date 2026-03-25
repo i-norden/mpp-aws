@@ -36,6 +36,14 @@ import * as log from '../../logging/index.js';
 import * as metrics from '../../metrics/index.js';
 import type { OFACChecker } from '../../ofac/checker.js';
 import type { Selectable } from 'kysely';
+import {
+  decrypt,
+  type EndpointAuth,
+  AUTH_TYPE_BEARER,
+  AUTH_TYPE_API_KEY,
+  AUTH_TYPE_BASIC,
+  AUTH_TYPE_CUSTOM_HEADER,
+} from '../../endpoint-auth/index.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -160,6 +168,42 @@ function setCachedFunction(name: string, fn: LambdaFunction, ttlSeconds: number)
 
 function invalidateFunctionCache(name: string): void {
   functionCache.delete(name);
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint auth helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Build HTTP headers from a decrypted EndpointAuth.
+ * Mirrors Go's endpointauth.ApplyAuth behaviour.
+ */
+function buildAuthHeaders(auth: EndpointAuth): Record<string, string> {
+  const headers: Record<string, string> = {};
+  switch (auth.type) {
+    case AUTH_TYPE_BEARER:
+      if (auth.token) {
+        headers['Authorization'] = `Bearer ${auth.token}`;
+      }
+      break;
+    case AUTH_TYPE_API_KEY:
+      if (auth.keyName && auth.keyValue && auth.keyLocation === 'header') {
+        headers[auth.keyName] = auth.keyValue;
+      }
+      break;
+    case AUTH_TYPE_BASIC:
+      if (auth.username && auth.password) {
+        const encoded = Buffer.from(`${auth.username}:${auth.password}`).toString('base64');
+        headers['Authorization'] = `Basic ${encoded}`;
+      }
+      break;
+    case AUTH_TYPE_CUSTOM_HEADER:
+      if (auth.headerName && auth.headerValue) {
+        headers[auth.headerName] = auth.headerValue;
+      }
+      break;
+  }
+  return headers;
 }
 
 // ---------------------------------------------------------------------------
@@ -426,10 +470,26 @@ export function createInvokeHandlers(deps: InvokeDeps) {
         }, 503);
       }
 
+      // Decrypt endpoint auth and build auth headers if configured
+      let endpointAuthHeaders: Record<string, string> | undefined;
+      if (dbFunction.endpoint_auth_encrypted && config.endpointAuthKey) {
+        try {
+          const auth = decrypt(dbFunction.endpoint_auth_encrypted, config.endpointAuthKey);
+          endpointAuthHeaders = buildAuthHeaders(auth);
+        } catch (err) {
+          log.error('failed to decrypt endpoint auth', {
+            function: functionName,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          // Continue without auth headers rather than failing the request
+        }
+      }
+
       result = await lambdaInvoker.invokeHTTPEndpoint(
         dbFunction.function_arn,
         payload,
         timeoutSeconds,
+        endpointAuthHeaders,
       );
 
       if (result.success) {

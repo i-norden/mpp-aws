@@ -347,6 +347,7 @@ export class LambdaInvoker {
     url: string,
     payload: unknown,
     timeoutSeconds: number,
+    authHeaders?: Record<string, string>,
   ): Promise<InvocationResult> {
     // Only HTTPS is allowed to prevent MITM attacks.
     if (!url.startsWith('https://')) {
@@ -394,9 +395,10 @@ export class LambdaInvoker {
     const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
 
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json', ...authHeaders };
       const response = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(payload ?? {}),
         signal: controller.signal,
       });

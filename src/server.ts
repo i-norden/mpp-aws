@@ -23,7 +23,7 @@ import type { Database } from './db/types.js';
 import { register } from './metrics/index.js';
 import { logger } from './logging/index.js';
 
-import { MPPClient } from './mpp/client.js';
+import { MPPServer } from './mpp/client.js';
 import { PricingEngine } from './pricing/engine.js';
 import { BillingService, type BillingStore } from './billing/service.js';
 import { LambdaInvoker } from './lambda/invoker.js';
@@ -43,6 +43,10 @@ import {
   WebhookBandwidthNotifier,
 } from './lease/bandwidth-worker.js';
 import { PriceCalculator } from './aws-pricing/calculator.js';
+import { LeaseService, type LeaseServiceConfig } from './lease/service.js';
+import { Store } from './db/store.js';
+import { AsyncJobWorker } from './jobs/worker.js';
+import { BackgroundWorkers } from './workers/index.js';
 
 // DB store functions needed for building adapters
 import {
@@ -221,6 +225,8 @@ interface Workers {
   provisioningWorker?: ProvisioningWorker;
   expiryWorker?: ExpiryWorker;
   bandwidthWorker?: BandwidthWorker;
+  asyncJobWorker?: AsyncJobWorker;
+  backgroundWorkers?: BackgroundWorkers;
 }
 
 // ---------------------------------------------------------------------------
@@ -243,8 +249,12 @@ export function createApp(deps: ServerDeps): { app: Hono; workers: Workers; bill
   // -----------------------------------------------------------------------
   // 1. MPP Client
   // -----------------------------------------------------------------------
-  const mppClient = new MPPClient({
-    facilitatorURL: cfg.facilitatorURL,
+  const mppServer = new MPPServer({
+    currency: cfg.usdcAddress,
+    recipient: cfg.payToAddress,
+    testnet: cfg.network !== 'base',
+    realm: cfg.publicURL || undefined,
+    secretKey: cfg.mppSecretKey || undefined,
     successThreshold: cfg.cbSuccessThreshold,
   });
 
@@ -300,6 +310,8 @@ export function createApp(deps: ServerDeps): { app: Hono; workers: Workers; bill
   // 7. EC2 Manager, Lease Service, Workers (if lease enabled)
   // -----------------------------------------------------------------------
   let ec2Manager: EC2ManagerImpl | undefined;
+  let leaseService: LeaseService | undefined;
+  let priceCalculator: PriceCalculator | undefined;
 
   if (cfg.leaseEnabled && db) {
     ec2Manager = new EC2ManagerImpl({
@@ -310,13 +322,21 @@ export function createApp(deps: ServerDeps): { app: Hono; workers: Workers; bill
     });
 
     // Price calculator for dynamic pricing sync (used by lease handler)
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    const priceCalculator = new PriceCalculator(
+    priceCalculator = new PriceCalculator(
       db,
       cfg.awsRegion,
       cfg.leasePriceMaxAgeHours * 60 * 60 * 1000,
     );
-    void priceCalculator; // Will be wired to lease handler via router deps
+
+    // Lease service for lease lifecycle management
+    const leaseServiceConfig: LeaseServiceConfig = {
+      maxPerUser: cfg.leaseMaxPerUser,
+      maxProvisionAttempts: cfg.leaseMaxProvisionAttempts,
+      maxGlobalActive: cfg.leaseMaxGlobalActive,
+      expiryWarningThresholdMs: cfg.leaseExpiryWarningMinutes * 60 * 1000,
+    };
+    leaseService = new LeaseService(new Store(db), leaseServiceConfig);
+    leaseService.setCalculator(priceCalculator);
 
     // Provisioning worker
     const workerConfig: WorkerConfig = {
@@ -357,17 +377,48 @@ export function createApp(deps: ServerDeps): { app: Hono; workers: Workers; bill
   }
 
   // -----------------------------------------------------------------------
+  // 7b. Async Job Worker (if enabled)
+  // -----------------------------------------------------------------------
+  if (cfg.asyncJobsEnabled && db) {
+    const asyncJobWorker = new AsyncJobWorker({
+      db,
+      lambdaInvoker,
+      billingService,
+      config: cfg,
+    });
+    const intervalMs = (cfg.asyncJobWorkerInterval > 0 ? cfg.asyncJobWorkerInterval : 5) * 1000;
+    asyncJobWorker.start(intervalMs);
+    workers.asyncJobWorker = asyncJobWorker;
+    logger.info('Async job worker started');
+  }
+
+  // -----------------------------------------------------------------------
+  // 7c. Background Workers (nonce cleanup, budget expiry, etc.)
+  // -----------------------------------------------------------------------
+  if (db) {
+    const backgroundWorkers = new BackgroundWorkers({
+      db,
+      billingService,
+      config: cfg,
+    });
+    backgroundWorkers.start();
+    workers.backgroundWorkers = backgroundWorkers;
+  }
+
+  // -----------------------------------------------------------------------
   // 8. Build router with all deps
   // -----------------------------------------------------------------------
   const routerDeps: RouterDeps = {
     config: cfg,
     db: db!,
-    mppClient,
+    mppServer,
     pricingEngine,
     billingService,
     lambdaInvoker,
     paymentStore,
     ec2Manager,
+    leaseService,
+    priceCalculator,
     ofacChecker,
   };
 
@@ -423,12 +474,14 @@ export function startServer(
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Received shutdown signal, draining...');
 
-    // Stop lease workers first
+    // Stop workers first
     if (opts?.workers) {
       opts.workers.provisioningWorker?.stop();
       opts.workers.expiryWorker?.stop();
       opts.workers.bandwidthWorker?.stop();
-      logger.info('Lease workers stopped');
+      opts.workers.asyncJobWorker?.stop();
+      opts.workers.backgroundWorkers?.stop();
+      logger.info('Workers stopped');
     }
 
     // Close billing service (stops refund service)

@@ -32,6 +32,7 @@ export interface Config {
   network: string;
   payToAddress: string;
   usdcAddress: string;
+  mppSecretKey: string;
 
   // AWS
   awsRegion: string;
@@ -267,6 +268,7 @@ export function loadConfig(): Config {
     network,
     payToAddress: getEnvOrEmpty('PAY_TO_ADDRESS'),
     usdcAddress: getEnv('USDC_ADDRESS', '0x036CbD53842c5426634e7929541eC2318f3dCF7e'),
+    mppSecretKey: getEnvOrEmpty('MPP_SECRET_KEY'),
 
     // AWS
     awsRegion: getEnv('AWS_REGION', 'us-east-1'),

@@ -13,12 +13,13 @@ import type { Kysely } from 'kysely';
 import type { Config } from '../config/index.js';
 import { adminEnabled } from '../config/index.js';
 import type { Database } from '../db/types.js';
-import type { MPPClient } from '../mpp/client.js';
+import type { MPPServer } from '../mpp/client.js';
 import type { PricingEngine } from '../pricing/engine.js';
 import type { BillingService } from '../billing/service.js';
 import type { LambdaInvoker } from '../lambda/invoker.js';
 import type { OFACChecker } from '../ofac/checker.js';
 import type { RefundService } from '../refund/service.js';
+import type { PriceCalculator } from '../aws-pricing/calculator.js';
 
 // Middleware
 import { corsMiddleware } from './middleware/cors.js';
@@ -45,7 +46,7 @@ import { createBudgetsHandlers } from './handlers/budgets.js';
 import { createCreditsHandlers } from './handlers/credits.js';
 import { createEarningsHandlers } from './handlers/earnings.js';
 import { createOwnerHandlers } from './handlers/owner.js';
-import { createLeaseHandlers, type LeaseDeps } from './handlers/lease.js';
+import { createLeaseHandlers } from './handlers/lease.js';
 import { createAdminHandlers } from './handlers/admin.js';
 
 // Metrics (for /metrics endpoint)
@@ -70,13 +71,14 @@ export type { LeaseService } from '../lease/service.js';
 export interface RouterDeps {
   config: Config;
   db: Kysely<Database>;
-  mppClient: MPPClient;
+  mppServer: MPPServer;
   pricingEngine: PricingEngine;
   billingService: BillingService;
   lambdaInvoker: LambdaInvoker;
   paymentStore?: PaymentStore;
   leaseService?: LeaseService;
   ec2Manager?: import('../lease/worker.js').EC2Manager;
+  priceCalculator?: PriceCalculator;
   ofacChecker?: OFACChecker | null;
   refundService?: RefundService | null;
   collectionService?: RefundService | null;
@@ -164,7 +166,7 @@ export function createRouter(deps: RouterDeps): Hono {
   // =========================================================================
 
   const { requirePayment } = createPaymentMiddleware({
-    mppClient: deps.mppClient,
+    mppServer: deps.mppServer,
     cfg,
     store: deps.paymentStore,
     ofacChecker: deps.ofacChecker ?? undefined,
@@ -366,7 +368,10 @@ export function createRouter(deps: RouterDeps): Hono {
     const leaseHandlers = createLeaseHandlers({
       db: deps.db,
       config: cfg,
-    } as LeaseDeps);
+      leaseService: deps.leaseService,
+      priceCalculator: deps.priceCalculator,
+      ec2Manager: deps.ec2Manager,
+    });
 
     const leaseLimiter = createRateLimiter(
       { rate: cfg.leaseRateLimit, burst: cfg.leaseRateBurst, cleanupIntervalMs: CLEANUP_INTERVAL_MS },

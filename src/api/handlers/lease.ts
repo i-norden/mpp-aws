@@ -29,6 +29,9 @@ type LeaseResource = Selectable<LeaseResourceTable>;
 export interface LeaseDeps {
   db: Kysely<Database>;
   config: Config;
+  leaseService?: import('../../lease/service.js').LeaseService;
+  priceCalculator?: import('../../aws-pricing/calculator.js').PriceCalculator;
+  ec2Manager?: import('../../lease/worker.js').EC2Manager;
 }
 
 interface ResourcePricing {
