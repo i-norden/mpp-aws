@@ -1,6 +1,5 @@
 /**
- * Router assembly -- registers ALL routes matching the Go SetupRouter exactly.
- * TypeScript port of mmp-compute/lambda-proxy/internal/api/router.go
+ * Router assembly for the TypeScript service.
  *
  * This is the single source of truth for HTTP routing. Handler creation,
  * middleware wiring, and rate-limiter construction all happen here so the
@@ -25,6 +24,9 @@ import type { RefundService } from '../refund/service.js';
 import { corsMiddleware } from './middleware/cors.js';
 import { createPaymentMiddleware, type PaymentStore } from './middleware/mpp.js';
 import { adminAuthMiddleware } from './middleware/admin-auth.js';
+import { jsonSerializationMiddleware } from './middleware/json.js';
+import { requestIdMiddleware } from './middleware/request-id.js';
+import { requestLoggingMiddleware } from './middleware/logging.js';
 import {
   rateLimitMiddleware,
   ipKeyFunc,
@@ -130,6 +132,9 @@ export function createRouter(deps: RouterDeps): Hono {
   // Global middleware
   // =========================================================================
 
+  app.use('*', requestIdMiddleware());
+  app.use('*', jsonSerializationMiddleware());
+  app.use('*', requestLoggingMiddleware());
   app.use('*', corsMiddleware(cfg.corsAllowedOrigins));
 
   // =========================================================================
@@ -315,18 +320,6 @@ export function createRouter(deps: RouterDeps): Hono {
   app.get('/budgets', budgetsHandlers.handleListBudgets);
   app.get('/budgets/:budgetId', budgetsHandlers.handleGetBudget);
   app.delete('/budgets/:budgetId', budgetsHandlers.handleRevokeBudget);
-
-  // =========================================================================
-  // Pipeline endpoints (requires payment)
-  // Mirrors Go pipelineGroup -- not yet implemented in TS handlers, so we
-  // register placeholder 501 handlers to preserve route parity.
-  // =========================================================================
-
-  app.post('/pipelines', requirePayment(
-    () => cfg.baseFee,
-    () => 'Pipeline submission',
-  ), (c) => c.json({ error: 'not implemented' }, 501));
-  app.get('/pipelines/:pipelineId', (c) => c.json({ error: 'not implemented' }, 501));
 
   // =========================================================================
   // Credit management endpoints (authenticated, address-based)

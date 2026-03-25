@@ -86,8 +86,8 @@ All endpoints under `/admin/*` -- function management, lease management, billing
 ## Payment Flow
 
 1. Client sends request without payment
-2. Server returns `402` with `WWW-Authenticate: MPP` and payment requirements
-3. Client signs payment and retries with `Authorization: MPP <credential>`
+2. Server returns `402` with `WWW-Authenticate: Payment` and payment requirements
+3. Client signs payment and retries with `Authorization: Payment <credential>`
 4. Server verifies and settles payment on-chain, then processes the request
 5. If overpaid, server issues an automatic USDC refund or credits the difference
 
@@ -99,7 +99,7 @@ src/
   db/              -- kysely database layer with 33 SQL migrations
   api/
     handlers/      -- route handlers (invoke, lease, credits, admin, etc.)
-    middleware/     -- CORS, MPP payment, admin auth, rate limiting
+    middleware/     -- CORS, Payment auth, request IDs, logging, rate limiting
     router.ts      -- route assembly
   mpp/             -- MPP client with circuit breaker
   pricing/         -- lambda cost calculation

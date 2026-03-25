@@ -13,7 +13,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "migrate": "tsx src/db/migrate-cli.ts",
-    "lint": "eslint src/"
+    "lint": "node scripts/lint.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-cloudwatch": "^3.700.0",

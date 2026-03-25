@@ -1,3 +1,5 @@
+import { Receipt } from 'mppx';
+
 export const MAX_PAYMENT_AMOUNT_ATOMIC = 1_000_000_000_000n; // $1,000,000 USDC
 
 export interface PaymentRequirements {
@@ -106,4 +108,13 @@ export function validatePaymentAmount(amount: bigint): string | null {
 export function decodePaymentHeader(header: string): PaymentPayload {
   const decoded = Buffer.from(header, 'base64').toString('utf-8');
   return JSON.parse(decoded) as PaymentPayload;
+}
+
+export function createPaymentReceipt(reference: string): string {
+  return Receipt.serialize(Receipt.from({
+    method: 'tempo',
+    reference,
+    status: 'success',
+    timestamp: new Date().toISOString(),
+  }));
 }

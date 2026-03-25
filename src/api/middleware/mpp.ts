@@ -5,7 +5,11 @@
 import type { Context, MiddlewareHandler } from 'hono';
 import type { MPPClient } from '../../mpp/client.js';
 import type { PaymentInfo, PaymentRequirements } from '../../mpp/types.js';
-import { createPaymentRequirements, decodePaymentHeader } from '../../mpp/types.js';
+import {
+  createPaymentReceipt,
+  createPaymentRequirements,
+  decodePaymentHeader,
+} from '../../mpp/types.js';
 import type { Config } from '../../config/index.js';
 import type { OFACChecker } from '../../ofac/checker.js';
 import { validateEthAddress } from '../../validation/index.js';
@@ -89,7 +93,7 @@ function setPaymentRequiredResponse(
 
   const encoded = Buffer.from(reqJSON).toString('base64');
   c.header('X-PAYMENT', encoded);
-  c.header('WWW-Authenticate', 'MPP');
+  c.header('WWW-Authenticate', 'Payment');
 
   const body: PaymentRequiredResponseBody = {
     type: 'https://paymentauth.org/problems/payment-required',
@@ -151,7 +155,8 @@ function extractPaymentHeader(c: Context): string {
     const spaceIdx = authorization.indexOf(' ');
     if (spaceIdx > 0) {
       const scheme = authorization.slice(0, spaceIdx);
-      if (scheme.toLowerCase() === 'mpp') {
+      const normalizedScheme = scheme.toLowerCase();
+      if (normalizedScheme === 'mpp' || normalizedScheme === 'payment') {
         return authorization.slice(spaceIdx + 1).trim();
       }
     }
@@ -572,8 +577,10 @@ export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
         };
         const responseJSON = JSON.stringify(responseHeader);
         const encoded = Buffer.from(responseJSON).toString('base64');
+        const paymentReceipt = createPaymentReceipt(txHash || 'unknown');
         c.header('X-PAYMENT-RESPONSE', encoded);
-        c.header('X-MPP-RECEIPT', encoded);
+        c.header('Payment-Receipt', paymentReceipt);
+        c.header('X-MPP-RECEIPT', paymentReceipt);
       } catch (err: unknown) {
         // Log the marshal error -- continue without the header rather than
         // failing the request.

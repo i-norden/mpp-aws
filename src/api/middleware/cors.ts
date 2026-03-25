@@ -19,11 +19,11 @@ export function corsMiddleware(allowedOrigins: string[]): MiddlewareHandler {
       c.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
       c.header(
         'Access-Control-Allow-Headers',
-        'Origin, Content-Type, Authorization, X-PAYMENT, X-Wallet-Address, X-Wallet-Signature, X-Wallet-Message, X-Admin-Key, X-Signature, X-Message, X-Requested-With, X-Budget-Id',
+        'Origin, Content-Type, Authorization, X-PAYMENT, X-Wallet-Address, X-Wallet-Signature, X-Wallet-Message, X-Admin-Key, X-Signature, X-Message, X-Requested-With, X-Budget-Id, X-Request-Id',
       );
       c.header(
         'Access-Control-Expose-Headers',
-        'X-PAYMENT-RESPONSE, X-MPP-RECEIPT, WWW-Authenticate',
+        'X-PAYMENT-RESPONSE, X-MPP-RECEIPT, Payment-Receipt, WWW-Authenticate, X-Request-Id',
       );
       c.header('Access-Control-Max-Age', '86400');
       if (allowedOrigin !== '*') {

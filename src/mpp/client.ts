@@ -56,26 +56,35 @@ export class MPPClient {
       if (!enriched.network) enriched.network = requirements.network;
 
       const start = Date.now();
-      const resp = await fetch(`${this.facilitatorURL}/verify`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          version: 1,
-          paymentPayload: enriched,
-          paymentRequirements: requirements,
-        }),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
+      try {
+        const resp = await fetch(`${this.facilitatorURL}/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            version: 1,
+            paymentPayload: enriched,
+            paymentRequirements: requirements,
+          }),
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
 
-      const duration = (Date.now() - start) / 1000;
-      recordFacilitatorCall('verify', duration);
+        if (!resp.ok) {
+          const body = await resp.text();
+          throw new Error(`facilitator verify returned status ${resp.status}: ${body}`);
+        }
 
-      if (!resp.ok) {
-        const body = await resp.text();
-        throw new Error(`facilitator verify returned status ${resp.status}: ${body}`);
+        const duration = (Date.now() - start) / 1000;
+        recordFacilitatorCall('verify', duration);
+        return (await resp.json()) as VerifyResponse;
+      } catch (error) {
+        const duration = (Date.now() - start) / 1000;
+        recordFacilitatorCall(
+          'verify',
+          duration,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        throw error;
       }
-
-      return (await resp.json()) as VerifyResponse;
     });
   }
 
@@ -93,26 +102,35 @@ export class MPPClient {
       if (!enriched.network) enriched.network = requirements.network;
 
       const start = Date.now();
-      const resp = await fetch(`${this.facilitatorURL}/settle`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          version: 1,
-          paymentPayload: enriched,
-          paymentRequirements: requirements,
-        }),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
+      try {
+        const resp = await fetch(`${this.facilitatorURL}/settle`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            version: 1,
+            paymentPayload: enriched,
+            paymentRequirements: requirements,
+          }),
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
 
-      const duration = (Date.now() - start) / 1000;
-      recordFacilitatorCall('settle', duration);
+        if (!resp.ok) {
+          const body = await resp.text();
+          throw new Error(`facilitator settle returned status ${resp.status}: ${body}`);
+        }
 
-      if (!resp.ok) {
-        const body = await resp.text();
-        throw new Error(`facilitator settle returned status ${resp.status}: ${body}`);
+        const duration = (Date.now() - start) / 1000;
+        recordFacilitatorCall('settle', duration);
+        return (await resp.json()) as SettleResponse;
+      } catch (error) {
+        const duration = (Date.now() - start) / 1000;
+        recordFacilitatorCall(
+          'settle',
+          duration,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        throw error;
       }
-
-      return (await resp.json()) as SettleResponse;
     });
   }
 
