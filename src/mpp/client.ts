@@ -1,38 +1,90 @@
+/**
+ * MPP server module -- wraps the mppx SDK's Mppx.create() + tempo.charge()
+ * to handle the 402 challenge/credential/receipt flow.
+ *
+ * Replaces the old facilitator-based MPPClient with native on-chain
+ * verification via the mppx TypeScript SDK.
+ */
+
+import { Mppx, tempo, type Store } from 'mppx/server';
 import { CircuitBreaker } from '../circuit-breaker/index.js';
 import { recordFacilitatorCall } from '../metrics/index.js';
-import type {
-  PaymentPayload,
-  PaymentRequirements,
-  VerifyResponse,
-  SettleResponse,
-} from './types.js';
-import { validatePaymentAmount, MAX_PAYMENT_AMOUNT_ATOMIC } from './types.js';
 
-export interface MPPClientConfig {
-  facilitatorURL: string;
-  timeoutMs?: number;
-  maxRetries?: number;
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+export interface MPPServerConfig {
+  /** USDC token contract address. */
+  currency: string;
+  /** Recipient address that receives payments. */
+  recipient: string;
+  /** Whether to use testnet mode. */
+  testnet?: boolean;
+  /** Server realm (e.g., hostname). Auto-detected if not set. */
+  realm?: string;
+  /** Secret key for HMAC-bound challenge IDs (stateless verification). */
+  secretKey?: string;
+  /** Optional mppx Store for transaction hash replay protection. */
+  store?: Store.Store;
+  /** Circuit breaker: failure threshold before opening. */
   failureThreshold?: number;
+  /** Circuit breaker: successes needed to close from half-open. */
   successThreshold?: number;
+  /** Circuit breaker: time (ms) before half-open retry after open. */
   breakerTimeoutMs?: number;
 }
 
-export class MPPClient {
-  private readonly facilitatorURL: string;
-  private readonly timeoutMs: number;
-  private readonly maxRetries: number;
-  private readonly breaker: CircuitBreaker;
+// ---------------------------------------------------------------------------
+// Result type returned by chargeRequest()
+// ---------------------------------------------------------------------------
 
-  constructor(config: MPPClientConfig) {
-    this.facilitatorURL = config.facilitatorURL;
-    this.timeoutMs = config.timeoutMs ?? 30_000;
-    this.maxRetries = config.maxRetries ?? 3;
+export interface ChargeResult {
+  /** 402 = challenge issued (no credential or invalid), 200 = payment verified. */
+  status: 402 | 200;
+  /** The 402 Response with WWW-Authenticate header (only when status === 402). */
+  challengeResponse?: Response;
+  /**
+   * Attaches the Payment-Receipt header to your application response.
+   * Only available when status === 200.
+   */
+  withReceipt?: (response: Response) => Response;
+}
+
+// ---------------------------------------------------------------------------
+// MPPServer class
+// ---------------------------------------------------------------------------
+
+export class MPPServer {
+  private readonly breaker: CircuitBreaker;
+  readonly mppx: ReturnType<typeof Mppx.create<
+    [ReturnType<typeof tempo.charge>],
+    ReturnType<typeof import('mppx/server').Transport.http>
+  >>;
+
+  constructor(config: MPPServerConfig) {
     this.breaker = new CircuitBreaker({
       failureThreshold: config.failureThreshold ?? 5,
       successThreshold: config.successThreshold ?? 2,
       timeoutMs: config.breakerTimeoutMs ?? 30_000,
       maxConcurrentInHalfOpen: 1,
     });
+
+    this.mppx = Mppx.create({
+      methods: [
+        tempo.charge({
+          currency: config.currency as `0x${string}`,
+          recipient: config.recipient as `0x${string}`,
+          testnet: config.testnet,
+          store: config.store,
+        }),
+      ],
+      realm: config.realm,
+      secretKey: config.secretKey,
+    }) as ReturnType<typeof Mppx.create<
+      [ReturnType<typeof tempo.charge>],
+      ReturnType<typeof import('mppx/server').Transport.http>
+    >>;
   }
 
   circuitState() {
@@ -43,170 +95,56 @@ export class MPPClient {
     return this.breaker.getStats();
   }
 
-  async verify(payload: PaymentPayload, requirements: PaymentRequirements): Promise<VerifyResponse> {
-    // Pre-validate
-    const err = validatePaymentFields(payload, requirements);
-    if (err) {
-      return { isValid: false, invalidReason: err };
-    }
-
-    return this.doWithRetry(async () => {
-      const enriched = { ...payload };
-      if (!enriched.scheme) enriched.scheme = requirements.scheme;
-      if (!enriched.network) enriched.network = requirements.network;
-
-      const start = Date.now();
-      try {
-        const resp = await fetch(`${this.facilitatorURL}/verify`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            version: 1,
-            paymentPayload: enriched,
-            paymentRequirements: requirements,
-          }),
-          signal: AbortSignal.timeout(this.timeoutMs),
-        });
-
-        if (!resp.ok) {
-          const body = await resp.text();
-          throw new Error(`facilitator verify returned status ${resp.status}: ${body}`);
-        }
-
-        const duration = (Date.now() - start) / 1000;
-        recordFacilitatorCall('verify', duration);
-        return (await resp.json()) as VerifyResponse;
-      } catch (error) {
-        const duration = (Date.now() - start) / 1000;
-        recordFacilitatorCall(
-          'verify',
-          duration,
-          error instanceof Error ? error : new Error(String(error)),
-        );
-        throw error;
-      }
-    });
-  }
-
-  async settle(payload: PaymentPayload, requirements: PaymentRequirements): Promise<SettleResponse> {
-    // Pre-validate
-    const err = validatePaymentFields(payload, requirements);
-    if (err) {
-      return { success: false, errorReason: err };
-    }
-
-    // NO retries for settle — not idempotent
-    return this.doOnce(async () => {
-      const enriched = { ...payload };
-      if (!enriched.scheme) enriched.scheme = requirements.scheme;
-      if (!enriched.network) enriched.network = requirements.network;
-
-      const start = Date.now();
-      try {
-        const resp = await fetch(`${this.facilitatorURL}/settle`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            version: 1,
-            paymentPayload: enriched,
-            paymentRequirements: requirements,
-          }),
-          signal: AbortSignal.timeout(this.timeoutMs),
-        });
-
-        if (!resp.ok) {
-          const body = await resp.text();
-          throw new Error(`facilitator settle returned status ${resp.status}: ${body}`);
-        }
-
-        const duration = (Date.now() - start) / 1000;
-        recordFacilitatorCall('settle', duration);
-        return (await resp.json()) as SettleResponse;
-      } catch (error) {
-        const duration = (Date.now() - start) / 1000;
-        recordFacilitatorCall(
-          'settle',
-          duration,
-          error instanceof Error ? error : new Error(String(error)),
-        );
-        throw error;
-      }
-    });
-  }
-
-  private async doOnce<T>(fn: () => Promise<T>): Promise<T> {
+  /**
+   * Processes a charge against an incoming HTTP request.
+   *
+   * Uses the mppx server handler internally:
+   * - If no credential is present: returns a 402 with a Challenge.
+   * - If a valid credential is present: verifies on-chain and returns 200 with a receipt.
+   *
+   * The circuit breaker wraps the entire call. Metrics are recorded
+   * the same as before (via recordFacilitatorCall).
+   */
+  async chargeRequest(
+    request: Request,
+    amount: string,
+    description?: string,
+  ): Promise<ChargeResult> {
     if (!this.breaker.allow()) {
-      throw new Error('facilitator service unavailable (circuit open)');
+      throw new Error('mppx service unavailable (circuit open)');
     }
+
+    const start = Date.now();
     try {
-      const result = await fn();
-      this.breaker.success();
-      return result;
-    } catch (err) {
-      this.breaker.failure();
-      throw err;
-    }
-  }
+      const handler = this.mppx.tempo.charge({ amount, description });
+      const result = await handler(request);
+      const duration = (Date.now() - start) / 1000;
 
-  private async doWithRetry<T>(fn: () => Promise<T>): Promise<T> {
-    let lastErr: Error | undefined;
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      if (!this.breaker.allow()) {
-        throw new Error('facilitator service unavailable (circuit open)');
-      }
-      try {
-        const result = await fn();
+      if (result.status === 402) {
+        recordFacilitatorCall('challenge', duration);
         this.breaker.success();
-        return result;
-      } catch (err) {
-        this.breaker.failure();
-        lastErr = err instanceof Error ? err : new Error(String(err));
-
-        if (attempt < this.maxRetries) {
-          const backoff = 100 * Math.pow(2, attempt);
-          await new Promise((resolve) => setTimeout(resolve, backoff));
-        }
+        return {
+          status: 402,
+          challengeResponse: result.challenge,
+        };
       }
+
+      // status === 200, payment verified & settled
+      recordFacilitatorCall('settle', duration);
+      this.breaker.success();
+      return {
+        status: 200,
+        withReceipt: result.withReceipt,
+      };
+    } catch (error) {
+      const duration = (Date.now() - start) / 1000;
+      recordFacilitatorCall(
+        'settle',
+        duration,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      this.breaker.failure();
+      throw error;
     }
-    throw lastErr;
   }
-}
-
-function validatePaymentFields(
-  payload: PaymentPayload,
-  requirements: PaymentRequirements,
-): string | null {
-  if (!payload?.payload?.authorization?.from) return 'missing required payment information';
-  if (!payload.payload.authorization.value) return 'missing required payment information';
-  if (!requirements?.maxAmountRequired) return 'missing required payment information';
-
-  let paymentAmount: bigint;
-  try {
-    paymentAmount = BigInt(payload.payload.authorization.value);
-  } catch {
-    return 'invalid payment amount';
-  }
-
-  const amountErr = validatePaymentAmount(paymentAmount);
-  if (amountErr) return amountErr;
-
-  let requiredAmount: bigint;
-  try {
-    requiredAmount = BigInt(requirements.maxAmountRequired);
-  } catch {
-    return 'invalid payment amount';
-  }
-
-  if (requiredAmount <= 0n) return 'invalid payment amount';
-  if (requiredAmount > MAX_PAYMENT_AMOUNT_ATOMIC) return 'payment amount exceeds maximum allowed';
-  if (paymentAmount < requiredAmount) return 'payment amount is less than required';
-
-  if (
-    payload.payload.authorization.to &&
-    payload.payload.authorization.to !== requirements.payTo
-  ) {
-    return 'payment recipient does not match requirements';
-  }
-
-  return null;
 }

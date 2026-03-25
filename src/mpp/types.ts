@@ -2,100 +2,14 @@ import { Receipt } from 'mppx';
 
 export const MAX_PAYMENT_AMOUNT_ATOMIC = 1_000_000_000_000n; // $1,000,000 USDC
 
-export interface PaymentRequirements {
-  scheme: string;
-  network: string;
-  maxAmountRequired: string;
-  resource: string;
-  description: string;
-  mimeType: string;
-  payTo: string;
-  maxTimeoutSeconds: number;
-  asset: string;
-  outputSchema: unknown;
-  extra?: Record<string, unknown>;
-}
-
-export interface ExactEvmPayloadAuthorization {
-  from: string;
-  to: string;
-  value: string;
-  validAfter: string;
-  validBefore: string;
-  nonce: string;
-}
-
-export interface ExactEvmPayload {
-  signature: string;
-  authorization: ExactEvmPayloadAuthorization;
-}
-
-export interface PaymentPayload {
-  version: number;
-  scheme: string;
-  network: string;
-  payload: ExactEvmPayload;
-}
-
-export interface VerifyResponse {
-  isValid: boolean;
-  invalidReason?: string;
-  payer?: string;
-}
-
-export interface SettleResponse {
-  success: boolean;
-  transaction?: string;
-  txHash?: string;
-  network?: string;
-  errorReason?: string;
-  error?: string;
-}
-
-export interface PaymentRequiredResponse {
-  type: string;
-  title: string;
-  status: number;
-  detail: string;
-  challengeId: string;
-  version: number;
-  accepts: PaymentRequirements[];
-  error: string;
-}
-
-export interface PaymentResponseHeader {
-  success: boolean;
-  txHash?: string;
-  networkId?: string;
-}
-
+/**
+ * Payment information extracted after a successful payment or budget deduction.
+ * Set on the Hono context by the payment middleware.
+ */
 export interface PaymentInfo {
   amount: bigint;
   txHash: string;
   payer: string;
-  requirements?: PaymentRequirements;
-}
-
-export function createPaymentRequirements(
-  payTo: string,
-  amount: bigint,
-  resource: string,
-  description: string,
-  network: string,
-  usdcAddress: string,
-): PaymentRequirements {
-  return {
-    scheme: 'exact',
-    network,
-    maxAmountRequired: amount.toString(),
-    resource,
-    description,
-    mimeType: 'application/json',
-    payTo,
-    maxTimeoutSeconds: 60,
-    asset: usdcAddress,
-    outputSchema: null,
-  };
 }
 
 export function validatePaymentAmount(amount: bigint): string | null {
@@ -105,11 +19,9 @@ export function validatePaymentAmount(amount: bigint): string | null {
   return null;
 }
 
-export function decodePaymentHeader(header: string): PaymentPayload {
-  const decoded = Buffer.from(header, 'base64').toString('utf-8');
-  return JSON.parse(decoded) as PaymentPayload;
-}
-
+/**
+ * Creates a serialized Payment-Receipt header value using the mppx SDK.
+ */
 export function createPaymentReceipt(reference: string): string {
   return Receipt.serialize(Receipt.from({
     method: 'tempo',
@@ -117,4 +29,18 @@ export function createPaymentReceipt(reference: string): string {
     status: 'success',
     timestamp: new Date().toISOString(),
   }));
+}
+
+/**
+ * Extracts the Ethereum address from a `did:pkh:eip155:<chainId>:<address>` DID source string.
+ * Returns null if the source doesn't match the expected format.
+ */
+export function extractAddressFromSource(source: string | undefined): string | null {
+  if (!source) return null;
+  // did:pkh:eip155:<chainId>:<address>
+  const parts = source.split(':');
+  if (parts.length >= 5 && parts[0] === 'did' && parts[1] === 'pkh' && parts[2] === 'eip155') {
+    return parts[4]!.toLowerCase();
+  }
+  return null;
 }

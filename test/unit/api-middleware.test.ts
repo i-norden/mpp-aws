@@ -1,10 +1,12 @@
 import { Hono } from 'hono';
 import { describe, expect, it } from 'vitest';
+import { Challenge, Credential, PaymentRequest } from 'mppx';
 
 import type { Config } from '../../src/config/index.js';
 import { jsonSerializationMiddleware } from '../../src/api/middleware/json.js';
 import { createPaymentMiddleware } from '../../src/api/middleware/mpp.js';
 import { requestIdMiddleware } from '../../src/api/middleware/request-id.js';
+import type { MPPServer, ChargeResult } from '../../src/mpp/client.js';
 
 function createTestConfig(): Config {
   return {
@@ -62,6 +64,7 @@ function createTestConfig(): Config {
     memoryRatePer128MB: 100n,
     minEarningsWithdrawal: 100n,
     minRefundThreshold: 50n,
+    mppSecretKey: 'test-secret-key-for-hmac',
     network: 'base-sepolia',
     nonceExpirationHours: 24,
     ofacBlockedAddresses: '',
@@ -81,6 +84,40 @@ function createTestConfig(): Config {
     treasuryAddress: '',
     usdcAddress: '0x00000000000000000000000000000000000000bb',
   };
+}
+
+/**
+ * Helper: builds a proper mppx Authorization header for testing.
+ *
+ * Uses mppx SDK serialization so the credential is in the correct wire format
+ * that Credential.fromRequest / Credential.deserialize can parse.
+ */
+function buildMppxAuthorizationHeader(
+  payer: string,
+  challengeId: string,
+  cfg: Config,
+): string {
+  // Build a Challenge in the proper format
+  const challenge = Challenge.from({
+    id: challengeId,
+    realm: cfg.publicURL || 'localhost',
+    method: 'tempo',
+    intent: 'charge',
+    request: PaymentRequest.from({
+      amount: '100',
+      currency: cfg.usdcAddress,
+      recipient: cfg.payToAddress,
+    }),
+  });
+
+  // Build a Credential with the challenge and a test payload
+  const credential = Credential.from({
+    challenge,
+    payload: { hash: '0xtesthash', type: 'hash' as const },
+    source: `did:pkh:eip155:84532:${payer}`,
+  });
+
+  return Credential.serialize(credential);
 }
 
 describe('API middleware', () => {
@@ -109,38 +146,20 @@ describe('API middleware', () => {
     });
   });
 
-  it('advertises Payment auth and accepts Authorization: Payment', async () => {
+  it('returns 402 with WWW-Authenticate when no credential is present', async () => {
     const cfg = createTestConfig();
-    const payer = '0x00000000000000000000000000000000000000cc';
-    const payload = {
-      version: 1,
-      scheme: 'exact',
-      network: cfg.network,
-      payload: {
-        signature: '0xsignature',
-        authorization: {
-          from: payer,
-          nonce: 'nonce-1',
-          to: cfg.payToAddress,
-          validAfter: '0',
-          validBefore: '9999999999',
-          value: '100',
-        },
+
+    // Mock MPPServer -- should not be called when there's no credential
+    const mockMppServer = {
+      async chargeRequest(): Promise<ChargeResult> {
+        throw new Error('should not be called');
       },
-    };
-    const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64');
+    } as unknown as MPPServer;
 
     const app = new Hono();
     const { requirePayment } = createPaymentMiddleware({
       cfg,
-      mppClient: {
-        async settle() {
-          return { success: true, txHash: '0xtesthash' };
-        },
-        async verify() {
-          return { isValid: true, payer };
-        },
-      } as never,
+      mppServer: mockMppServer,
     });
 
     app.post(
@@ -153,13 +172,60 @@ describe('API middleware', () => {
       method: 'POST',
     });
 
+    // No credential -> 402 with WWW-Authenticate
     expect(challengeResponse.status).toBe(402);
-    expect(challengeResponse.headers.get('www-authenticate')).toBe('Payment');
+    expect(challengeResponse.headers.get('www-authenticate')).toBeTruthy();
+    // Should also have legacy X-PAYMENT header for backward compat
     expect(challengeResponse.headers.get('x-payment')).toBeTruthy();
+  });
+
+  it('returns 200 with Payment-Receipt when mppx verifies successfully', async () => {
+    const cfg = createTestConfig();
+    const payer = '0x00000000000000000000000000000000000000cc';
+
+    // Mock MPPServer that returns 200 with receipt
+    const mockMppServer = {
+      async chargeRequest(): Promise<ChargeResult> {
+        return {
+          status: 200,
+          withReceipt: (response: Response) => {
+            const headers = new Headers(response.headers);
+            // Simulate mppx adding the Payment-Receipt header with a proper receipt
+            const receipt = {
+              method: 'tempo',
+              reference: '0xtesthash',
+              status: 'success',
+              timestamp: '2025-01-01T00:00:00.000Z',
+            };
+            const encoded = Buffer.from(JSON.stringify(receipt)).toString('base64url');
+            headers.set('Payment-Receipt', encoded);
+            return new Response(response.body, {
+              status: response.status,
+              headers,
+            });
+          },
+        };
+      },
+    } as unknown as MPPServer;
+
+    const app = new Hono();
+    const { requirePayment } = createPaymentMiddleware({
+      cfg,
+      mppServer: mockMppServer,
+    });
+
+    app.post(
+      '/invoke/demo',
+      requirePayment(() => 100n, () => 'demo charge'),
+      (c) => c.json({ ok: true }),
+    );
+
+    // Build a properly formatted mppx credential
+    const authHeader = buildMppxAuthorizationHeader(payer, 'test-challenge-id', cfg);
 
     const paidResponse = await app.request('http://localhost/invoke/demo', {
       method: 'POST',
-      headers: { Authorization: `Payment ${encodedPayload}` },
+      headers: { Authorization: authHeader },
     });
 
     expect(paidResponse.status).toBe(200);

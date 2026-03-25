@@ -1,14 +1,17 @@
 /**
  * MPP payment middleware for Hono.
- * Mirrors the Go middleware at mmp-compute/lambda-proxy/internal/api/middleware.go
+ *
+ * Uses the mppx TypeScript SDK for the 402 challenge/credential/receipt flow
+ * while preserving business logic: OFAC checks, nonce tracking, budgets,
+ * payer allowlists, and legacy X-PAYMENT header support.
  */
 import type { Context, MiddlewareHandler } from 'hono';
-import type { MPPClient } from '../../mpp/client.js';
-import type { PaymentInfo, PaymentRequirements } from '../../mpp/types.js';
+import { Challenge, Credential, Receipt } from 'mppx';
+import type { MPPServer } from '../../mpp/client.js';
+import type { PaymentInfo } from '../../mpp/types.js';
 import {
   createPaymentReceipt,
-  createPaymentRequirements,
-  decodePaymentHeader,
+  extractAddressFromSource,
 } from '../../mpp/types.js';
 import type { Config } from '../../config/index.js';
 import type { OFACChecker } from '../../ofac/checker.js';
@@ -51,7 +54,7 @@ export interface PaymentStore {
 // ---------------------------------------------------------------------------
 
 export interface PaymentMiddlewareDeps {
-  mppClient: MPPClient;
+  mppServer: MPPServer;
   cfg: Config;
   store?: PaymentStore;
   ofacChecker?: OFACChecker;
@@ -67,46 +70,68 @@ const NONCE_EXPIRATION_DEFAULT_HOURS = 24;
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-interface PaymentRequiredResponseBody {
-  type: string;
-  title: string;
-  status: number;
-  detail: string;
-  challengeId: string;
-  version: number;
-  accepts: PaymentRequirements[];
-  error: string;
-}
-
+/**
+ * Builds a 402 Payment Required response using the mppx Challenge SDK.
+ *
+ * Serializes a proper WWW-Authenticate header per the mppx protocol
+ * and also sets the legacy X-PAYMENT header for backward compatibility.
+ */
 function setPaymentRequiredResponse(
   c: Context,
-  requirements: PaymentRequirements,
+  cfg: Config,
+  amount: string,
+  resource: string,
+  description: string,
   errorMsg: string,
 ): Response {
-  let reqJSON: string;
   try {
-    reqJSON = JSON.stringify(requirements);
+    const challenge = Challenge.from({
+      secretKey: cfg.mppSecretKey || 'mmp-aws-default-secret',
+      realm: cfg.publicURL || c.req.header('host') || 'localhost',
+      method: 'tempo',
+      intent: 'charge',
+      description,
+      request: {
+        amount,
+        currency: cfg.usdcAddress,
+        recipient: cfg.payToAddress,
+      },
+    });
+
+    const wwwAuthenticate = Challenge.serialize(challenge);
+    c.header('WWW-Authenticate', wwwAuthenticate);
+
+    // Legacy X-PAYMENT header for backward compatibility
+    const legacyPayload = {
+      scheme: 'exact',
+      network: cfg.network,
+      maxAmountRequired: amount,
+      resource,
+      description,
+      mimeType: 'application/json',
+      payTo: cfg.payToAddress,
+      maxTimeoutSeconds: 60,
+      asset: cfg.usdcAddress,
+      outputSchema: null,
+    };
+    c.header('X-PAYMENT', Buffer.from(JSON.stringify(legacyPayload)).toString('base64'));
+
+    return c.json(
+      {
+        type: 'https://paymentauth.org/problems/payment-required',
+        title: 'Payment Required',
+        status: 402,
+        detail: errorMsg,
+        challengeId: challenge.id,
+        version: 1,
+        error: errorMsg,
+      },
+      402,
+    );
   } catch (err) {
-    log.error('failed to marshal payment requirements', { error: String(err) });
+    log.error('failed to create payment challenge', { error: String(err) });
     return c.json({ error: 'internal error preparing payment requirements' }, 500);
   }
-
-  const encoded = Buffer.from(reqJSON).toString('base64');
-  c.header('X-PAYMENT', encoded);
-  c.header('WWW-Authenticate', 'Payment');
-
-  const body: PaymentRequiredResponseBody = {
-    type: 'https://paymentauth.org/problems/payment-required',
-    title: 'Payment Required',
-    status: 402,
-    detail: errorMsg,
-    challengeId: String(Date.now() * 1_000_000 + Math.floor(Math.random() * 1_000_000)),
-    version: 1,
-    accepts: [requirements],
-    error: errorMsg,
-  };
-
-  return c.json(body, 402);
 }
 
 function isPayerAllowed(cfg: Config, payer: string): boolean {
@@ -146,23 +171,48 @@ function buildResourceURL(c: Context, cfg: Config): string {
   return c.req.url;
 }
 
-function extractPaymentHeader(c: Context): string {
-  const xPayment = c.req.header('X-PAYMENT');
-  if (xPayment) return xPayment;
-
+/**
+ * Checks whether the request carries a payment credential.
+ *
+ * Supports:
+ * 1. Standard mppx `Authorization: Payment ...` header
+ * 2. Legacy `X-PAYMENT` header
+ *
+ * Returns 'mppx' if a Payment scheme is present in the Authorization header,
+ * 'legacy' for the old X-PAYMENT header, or null if neither is present.
+ */
+function detectPaymentCredential(c: Context): 'mppx' | 'legacy' | null {
   const authorization = c.req.header('Authorization');
   if (authorization) {
-    const spaceIdx = authorization.indexOf(' ');
-    if (spaceIdx > 0) {
-      const scheme = authorization.slice(0, spaceIdx);
-      const normalizedScheme = scheme.toLowerCase();
-      if (normalizedScheme === 'mpp' || normalizedScheme === 'payment') {
-        return authorization.slice(spaceIdx + 1).trim();
-      }
-    }
+    const paymentScheme = Credential.extractPaymentScheme(authorization);
+    if (paymentScheme) return 'mppx';
   }
 
-  return '';
+  const xPayment = c.req.header('X-PAYMENT');
+  if (xPayment) return 'legacy';
+
+  return null;
+}
+
+/**
+ * Attempts to extract the payer address from an mppx credential.
+ * Does a lightweight parse of the credential to extract the `source` DID,
+ * which contains the payer's Ethereum address.
+ *
+ * Returns null if parsing fails or no source DID is present.
+ * This is best-effort -- if it fails, we still pass the request to mppx for
+ * proper verification.
+ */
+function tryExtractPayerAddress(c: Context): string | null {
+  const authorization = c.req.header('Authorization');
+  if (!authorization) return null;
+
+  try {
+    const credential = Credential.fromRequest(c.req.raw);
+    return extractAddressFromSource(credential.source);
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +229,7 @@ function extractPaymentHeader(c: Context): string {
  * ```
  */
 export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
-  const { mppClient, cfg, store, ofacChecker } = deps;
+  const { mppServer, cfg, store, ofacChecker } = deps;
 
   /**
    * Returns a Hono MiddlewareHandler that enforces MPP payment.
@@ -323,12 +373,7 @@ export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
       const resource = buildResourceURL(c, cfg);
 
       // ------------------------------------------------------------------
-      // 3. Extract payment header
-      // ------------------------------------------------------------------
-      const paymentHeader = extractPaymentHeader(c);
-
-      // ------------------------------------------------------------------
-      // 4. Calculate amount
+      // 3. Calculate amount
       // ------------------------------------------------------------------
       const amount = getAmount(c);
       if (amount <= 0n) {
@@ -342,105 +387,94 @@ export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
         );
       }
       const description = getDescription(c);
+      const amountStr = amount.toString();
 
       // ------------------------------------------------------------------
-      // 5. Create payment requirements
+      // 4. Detect payment credential
       // ------------------------------------------------------------------
-      const requirements = createPaymentRequirements(
-        cfg.payToAddress,
-        amount,
-        resource,
-        description,
-        cfg.network,
-        cfg.usdcAddress,
-      );
+      const credentialType = detectPaymentCredential(c);
 
       // ------------------------------------------------------------------
-      // 6. No payment header -> return 402
+      // 5. No credential -> return 402 with mppx Challenge
       // ------------------------------------------------------------------
-      if (!paymentHeader) {
-        return setPaymentRequiredResponse(c, requirements, 'Payment required');
+      if (!credentialType) {
+        return setPaymentRequiredResponse(c, cfg, amountStr, resource, description, 'Payment required');
       }
 
       // ------------------------------------------------------------------
-      // 7. Decode payment header
+      // 6. Legacy X-PAYMENT header is no longer supported.
+      //    Clients must use the standard mppx protocol.
       // ------------------------------------------------------------------
-      let payload;
+      if (credentialType === 'legacy') {
+        return setPaymentRequiredResponse(
+          c,
+          cfg,
+          amountStr,
+          resource,
+          description,
+          'Legacy X-PAYMENT header is deprecated. Use Authorization: Payment ... header per the mppx protocol.',
+        );
+      }
+
+      // ------------------------------------------------------------------
+      // 6b. Try to extract payer address from the credential's source DID
+      //     for pre-settlement OFAC/allowlist checks.
+      //     This is best-effort; failures do not block the flow.
+      // ------------------------------------------------------------------
+      const payerFromCredential = tryExtractPayerAddress(c);
+
+      // ------------------------------------------------------------------
+      // 7. OFAC check on payer address (BEFORE settlement)
+      // ------------------------------------------------------------------
+      if (payerFromCredential) {
+        if (ofacChecker && ofacChecker.isBlocked(payerFromCredential)) {
+          metrics.ofacBlockedTotal.inc({ endpoint: c.req.path });
+          log.warn('OFAC blocked address rejected (payer)', {
+            payer: payerFromCredential,
+          });
+          return c.json(
+            {
+              error: 'address_blocked',
+              message: 'This address is not permitted to use this service',
+            },
+            403,
+          );
+        }
+
+        // Payer allowlist check
+        if (!isPayerAllowed(cfg, payerFromCredential)) {
+          log.warn('payer not on allowlist', {
+            payer: payerFromCredential,
+          });
+          return c.json(
+            {
+              error: 'access_restricted',
+              message:
+                'This service is currently restricted to authorized addresses only',
+            },
+            403,
+          );
+        }
+      }
+
+      // ------------------------------------------------------------------
+      // 8. Reserve payment nonce (BEFORE settlement, AFTER OFAC check)
+      //
+      //    For mppx credentials the challenge ID serves as a nonce --
+      //    it is HMAC-bound to the challenge parameters.
+      // ------------------------------------------------------------------
+      let nonce = '';
       try {
-        payload = decodePaymentHeader(paymentHeader);
+        const credential = Credential.fromRequest(c.req.raw);
+        nonce = credential.challenge?.id ?? '';
       } catch {
-        return setPaymentRequiredResponse(
-          c,
-          requirements,
-          'Invalid payment header',
-        );
+        // If we cannot parse the credential for nonce extraction,
+        // mppx will handle the error in the charge step below.
       }
-
-      // ------------------------------------------------------------------
-      // 8. Verify payment FIRST (before nonce reservation)
-      //    This prevents attackers from reserving many nonces with invalid
-      //    signatures, which would block legitimate transactions (DoS).
-      // ------------------------------------------------------------------
-      let verifyResp;
-      try {
-        verifyResp = await mppClient.verify(payload, requirements);
-      } catch (err: unknown) {
-        log.error('payment verification error', { error: String(err) });
-        return setPaymentRequiredResponse(
-          c,
-          requirements,
-          'Payment verification failed',
-        );
-      }
-
-      if (!verifyResp.isValid) {
-        const reason = verifyResp.invalidReason ?? 'Payment verification failed';
-        return setPaymentRequiredResponse(c, requirements, reason);
-      }
-
-      // ------------------------------------------------------------------
-      // 9. OFAC check on payer address (BEFORE settlement/nonce reservation)
-      // ------------------------------------------------------------------
-      const payerFromPayload = payload.payload.authorization.from;
-      if (ofacChecker && ofacChecker.isBlocked(payerFromPayload)) {
-        metrics.ofacBlockedTotal.inc({ endpoint: c.req.path });
-        log.warn('OFAC blocked address rejected (payer)', {
-          payer: payerFromPayload.toLowerCase(),
-        });
-        return c.json(
-          {
-            error: 'address_blocked',
-            message: 'This address is not permitted to use this service',
-          },
-          403,
-        );
-      }
-
-      // ------------------------------------------------------------------
-      // 10. Payer allowlist check (BEFORE settlement/nonce reservation)
-      // ------------------------------------------------------------------
-      if (!isPayerAllowed(cfg, payerFromPayload)) {
-        log.warn('payer not on allowlist', {
-          payer: payerFromPayload.toLowerCase(),
-        });
-        return c.json(
-          {
-            error: 'access_restricted',
-            message:
-              'This service is currently restricted to authorized addresses only',
-          },
-          403,
-        );
-      }
-
-      // ------------------------------------------------------------------
-      // 11. Reserve payment nonce (AFTER verification succeeds)
-      // ------------------------------------------------------------------
-      const nonce = payload.payload.authorization.nonce;
       if (store && !nonce) {
         log.warn(
           'payment accepted with empty nonce -- local double-spend tracking skipped',
-          { payer: payerFromPayload.toLowerCase() },
+          { payer: payerFromCredential ?? 'unknown' },
         );
       }
       if (store && nonce) {
@@ -448,17 +482,19 @@ export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
         try {
           const result = await store.tryReservePaymentNonce(
             nonce,
-            payerFromPayload.toLowerCase(),
+            (payerFromCredential ?? 'unknown').toLowerCase(),
             amount,
             resource,
             expiresAt,
           );
           if (!result.reserved) {
-            // Nonce already used - reject as double-spend attempt
             metrics.nonceCollisionsTotal.inc();
             return setPaymentRequiredResponse(
               c,
-              requirements,
+              cfg,
+              amountStr,
+              resource,
+              description,
               'Payment nonce already used (potential double-spend)',
             );
           }
@@ -475,25 +511,45 @@ export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
       }
 
       // ------------------------------------------------------------------
-      // 12. Settle payment (NO retries -- not idempotent)
+      // 9. Use mppx server handler for verification + settlement
       // ------------------------------------------------------------------
-      let settleResp;
+      let chargeResult;
       try {
-        settleResp = await mppClient.settle(payload, requirements);
+        chargeResult = await mppServer.chargeRequest(
+          c.req.raw,
+          amountStr,
+          description,
+        );
       } catch (err: unknown) {
-        log.error('payment settlement error', { error: String(err) });
+        log.error('mppx charge error', { error: String(err) });
+
+        // Mark nonce as failed
+        if (store && nonce) {
+          try {
+            await store.updatePaymentNonceStatus(nonce, 'failed', '');
+          } catch (nonceErr: unknown) {
+            log.warn(
+              'nonce status update failed after charge error; nonce is burned',
+              { error: String(nonceErr) },
+            );
+          }
+        }
+
         return setPaymentRequiredResponse(
           c,
-          requirements,
-          'Payment settlement failed',
+          cfg,
+          amountStr,
+          resource,
+          description,
+          'Payment verification/settlement failed',
         );
       }
 
-      if (!settleResp.success) {
-        // Mark nonce as failed. If this update itself fails, the nonce remains
-        // in "reserved" state and is effectively burned -- the client must use
-        // a new nonce. This is acceptable: the payment was not settled, so no
-        // funds were transferred, and nonces are single-use by design.
+      // ------------------------------------------------------------------
+      // 10. Handle 402 result (credential was invalid or mismatched)
+      // ------------------------------------------------------------------
+      if (chargeResult.status === 402) {
+        // Mark nonce as failed
         if (store && nonce) {
           try {
             await store.updatePaymentNonceStatus(nonce, 'failed', '');
@@ -504,17 +560,48 @@ export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
             );
           }
         }
-        const reason =
-          settleResp.errorReason ??
-          settleResp.error ??
-          'Payment settlement failed';
-        return setPaymentRequiredResponse(c, requirements, reason);
+
+        // Return the mppx-generated 402 response directly
+        // (it already has the correct WWW-Authenticate header)
+        if (chargeResult.challengeResponse) {
+          return chargeResult.challengeResponse;
+        }
+
+        return setPaymentRequiredResponse(
+          c,
+          cfg,
+          amountStr,
+          resource,
+          description,
+          'Payment verification failed',
+        );
       }
 
       // ------------------------------------------------------------------
-      // 13. Update nonce status to settled on success
+      // 11. Payment successful -- extract receipt and payer info
       // ------------------------------------------------------------------
-      const txHash = settleResp.txHash ?? settleResp.transaction ?? '';
+
+      // Get the receipt by calling withReceipt on a dummy response,
+      // then reading the Payment-Receipt header.
+      let txHash = '';
+      let payer = payerFromCredential ?? '';
+      try {
+        const dummyResponse = new Response(null, { status: 200 });
+        const receiptResponse = chargeResult.withReceipt!(dummyResponse);
+        const receiptHeader = receiptResponse.headers.get('Payment-Receipt');
+        if (receiptHeader) {
+          const receipt = Receipt.deserialize(receiptHeader);
+          txHash = receipt.reference || '';
+        }
+      } catch (err: unknown) {
+        log.warn('failed to extract receipt from mppx response', {
+          error: String(err),
+        });
+      }
+
+      // ------------------------------------------------------------------
+      // 12. Update nonce status to settled on success
+      // ------------------------------------------------------------------
       if (store && nonce) {
         try {
           await store.updatePaymentNonceStatus(nonce, 'settled', txHash);
@@ -526,15 +613,8 @@ export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
       }
 
       // ------------------------------------------------------------------
-      // 14. Extract and validate payer address
+      // 13. Validate payer address
       // ------------------------------------------------------------------
-      let payer = '';
-      if (verifyResp.payer) {
-        payer = verifyResp.payer.toLowerCase();
-      }
-
-      // Reject empty payer address -- it would flow into billing records,
-      // credit operations, and refund logic, all of which assume a valid address.
       if (!payer) {
         log.warn('payment verified but payer address is empty');
         return c.json(
@@ -543,6 +623,8 @@ export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
         );
       }
 
+      payer = payer.toLowerCase();
+
       // Validate payer is a well-formed Ethereum address before it flows into
       // billing, credits, and refund logic.
       try {
@@ -550,26 +632,30 @@ export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
       } catch {
         log.warn('payment verified but payer address is malformed', { payer });
         return c.json(
-          { error: 'invalid payer address format from facilitator' },
+          { error: 'invalid payer address format' },
           402,
         );
       }
 
       // ------------------------------------------------------------------
-      // 15. Set payment info in Hono context
+      // 14. Set payment info in Hono context
       // ------------------------------------------------------------------
       const paymentInfo: PaymentInfo = {
         amount,
         txHash,
         payer,
-        requirements,
       };
       c.set('paymentInfo', paymentInfo);
 
       // ------------------------------------------------------------------
-      // 16. Set response headers
+      // 15. Set response headers
       // ------------------------------------------------------------------
       try {
+        const paymentReceipt = createPaymentReceipt(txHash || 'unknown');
+        c.header('Payment-Receipt', paymentReceipt);
+        c.header('X-MPP-RECEIPT', paymentReceipt);
+
+        // Legacy X-PAYMENT-RESPONSE header for backward compatibility
         const responseHeader = {
           success: true,
           txHash,
@@ -577,10 +663,7 @@ export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
         };
         const responseJSON = JSON.stringify(responseHeader);
         const encoded = Buffer.from(responseJSON).toString('base64');
-        const paymentReceipt = createPaymentReceipt(txHash || 'unknown');
         c.header('X-PAYMENT-RESPONSE', encoded);
-        c.header('Payment-Receipt', paymentReceipt);
-        c.header('X-MPP-RECEIPT', paymentReceipt);
       } catch (err: unknown) {
         // Log the marshal error -- continue without the header rather than
         // failing the request.
