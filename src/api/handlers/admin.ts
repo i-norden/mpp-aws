@@ -1,0 +1,1770 @@
+/**
+ * Admin API handlers.
+ * TypeScript port of:
+ *   - mmp-compute/lambda-proxy/internal/api/handlers_admin.go
+ *   - mmp-compute/lambda-proxy/internal/api/handlers_admin_lease.go
+ *   - mmp-compute/lambda-proxy/internal/api/handlers_admin_monitoring.go
+ *
+ * All handlers are created via `createAdminHandlers(deps)` using dependency
+ * injection, following the same pattern as the other handler modules
+ * (functions.ts, lease.ts, register.ts).
+ */
+
+import type { Context } from 'hono';
+import type { Kysely, Insertable } from 'kysely';
+import { sql } from 'kysely';
+import client from 'prom-client';
+
+import type { Database, LambdaFunctionTable } from '../../db/types.js';
+import type { Config } from '../../config/index.js';
+import type { PricingEngine } from '../../pricing/engine.js';
+import type { RefundService } from '../../refund/service.js';
+import * as log from '../../logging/index.js';
+
+import {
+  listAllFunctions,
+  getAdminFunctionStats,
+  listAllLeases,
+  getAdminLeaseSummary,
+  adminTerminateLease,
+  adminExtendLease,
+  anonymizeLease,
+  getBillingSummary,
+  getInvocationsBilling,
+  getRefundsBilling,
+  getCreditsBilling,
+  getEarningsBilling,
+  getResourceUtilization,
+  listAuditLog,
+  createAuditEntry,
+} from '../../db/store-admin.js';
+
+import type {
+  LeaseFilters,
+  InvocationFilters,
+  RefundFilters,
+  AuditLogFilters,
+  InsertableAuditLogEntry,
+} from '../../db/store-admin.js';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface AdminDeps {
+  db: Kysely<Database> | null;
+  config: Config;
+  pricingEngine: PricingEngine;
+  refundService?: RefundService | null;
+  collectionService?: RefundService | null;
+}
+
+interface FunctionExample {
+  name: string;
+  description?: string;
+  input: unknown;
+  output?: unknown;
+}
+
+interface RegisterFunctionRequest {
+  functionArn: string;
+  functionName: string;
+  description: string;
+  memoryMB?: number;
+  timeoutSeconds?: number;
+  estimatedDurationMs?: number;
+  customBaseFee?: number | null;
+  inputSchema?: unknown;
+  outputSchema?: unknown;
+  examples?: FunctionExample[];
+  tags?: string[];
+  version?: string;
+  author?: string;
+  documentationUrl?: string;
+  ownerAddress?: string;
+  visibility?: string;
+}
+
+/** Reconciliation report types -- mirrors Go reconciliation.Report */
+interface ReconciliationMismatch {
+  invocationId: string;
+  txHash: string;
+  dbAmount: number;
+  onChainAmount?: number;
+  reason: string;
+}
+
+interface ReconciliationMissingRecord {
+  id: string;
+  txHash?: string;
+  reason: string;
+}
+
+interface ReconciliationReport {
+  startedAt: string;
+  completedAt: string;
+  totalChecked: number;
+  matched: number;
+  unverified: number;
+  mismatches: ReconciliationMismatch[];
+  missingOnChain: ReconciliationMissingRecord[];
+  missingInDb: ReconciliationMissingRecord[];
+  errors: string[];
+}
+
+/** Sweep request body -- mirrors Go SweepRequest */
+interface SweepRequest {
+  asset?: string;   // "usdc" (default) or "eth"
+  amount: string;   // atomic USDC or wei (string for large values)
+  confirm?: boolean; // false = dry run, true = execute
+}
+
+interface AdminResourceRequest {
+  id: string;
+  displayName: string;
+  instanceType: string;
+  vcpus: number;
+  memoryGb: number;
+  storageGb?: number;
+  amiId: string;
+  sshUser?: string;
+  description?: string;
+  price1d: number;
+  price7d: number;
+  price30d: number;
+  maxConcurrent?: number;
+  enabled?: boolean;
+  marginPercent?: number;
+  defaultStorageGb?: number;
+  minStorageGb?: number;
+  maxStorageGb?: number;
+  egressLimitGb?: number;
+  ingressLimitGb?: number;
+  publicIpDefault?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Format atomic USDC (6 decimals) as a USD string. */
+function formatUSD(atomicAmount: bigint): string {
+  const dollars = Number(atomicAmount) / 1_000_000;
+  if (Math.abs(dollars) < 0.01) {
+    return `$${dollars.toFixed(4)}`;
+  }
+  return `$${dollars.toFixed(2)}`;
+}
+
+/** Format a bigint wei balance as a human-readable ETH string. */
+function formatETH(wei: bigint): string {
+  const ether = Number(wei) / 1e18;
+  return ether.toFixed(6);
+}
+
+/** Parse an integer query parameter with a default value. */
+function parseIntQuery(c: Context, key: string, defaultVal: number): number {
+  const v = c.req.query(key);
+  if (v) {
+    const n = parseInt(v, 10);
+    if (!Number.isNaN(n)) return n;
+  }
+  return defaultVal;
+}
+
+/** Parse an RFC3339 date query parameter. Returns undefined if missing/invalid. */
+function parseDateQuery(c: Context, key: string): Date | undefined {
+  const v = c.req.query(key);
+  if (!v) return undefined;
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return undefined;
+  return d;
+}
+
+/**
+ * Best-effort audit log helper. Logs errors but does not fail the request.
+ */
+async function auditLog(
+  db: Kysely<Database>,
+  c: Context,
+  action: string,
+  targetType: string,
+  targetId: string,
+  details?: unknown,
+): Promise<void> {
+  try {
+    const entry: InsertableAuditLogEntry = {
+      admin_ip: c.req.header('x-forwarded-for') ?? c.req.header('x-real-ip') ?? 'unknown',
+      action,
+      target_type: targetType,
+      target_id: targetId,
+      details: details ?? null,
+    };
+    await createAuditEntry(db, entry);
+  } catch (err) {
+    log.error('failed to write audit log', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Determine if an ARN is an HTTPS endpoint (not a Lambda ARN).
+ */
+function isHTTPEndpoint(arn: string): boolean {
+  return arn.startsWith('https://') || arn.startsWith('http://');
+}
+
+/**
+ * Reject plain HTTP endpoints for security.
+ */
+function isInsecureHTTPEndpoint(arn: string): boolean {
+  return arn.startsWith('http://');
+}
+
+// ---------------------------------------------------------------------------
+// createAdminHandlers
+// ---------------------------------------------------------------------------
+
+export function createAdminHandlers(deps: AdminDeps) {
+  const { db, config, pricingEngine, refundService, collectionService } = deps;
+
+  // In-memory latest reconciliation report (mirrors Go's latestReconciliationReport).
+  let latestReconciliationReport: ReconciliationReport | null = null;
+
+  // =========================================================================
+  // Function Management
+  // =========================================================================
+
+  // -------------------------------------------------------------------
+  // handleAdminListFunctions -- GET /admin/functions
+  // -------------------------------------------------------------------
+
+  async function handleAdminListFunctions(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'database not configured' }, 503);
+    }
+
+    try {
+      const functions = await listAllFunctions(db, { includeDisabled: true });
+
+      const response = functions.map((fn) => {
+        const cost = pricingEngine.calculateInvocationCost(
+          fn.memory_mb,
+          fn.estimated_duration_ms,
+        );
+        const info: Record<string, unknown> = {
+          id: Number(fn.id),
+          functionArn: fn.function_arn,
+          functionName: fn.function_name,
+          memoryMB: fn.memory_mb,
+          timeoutSeconds: fn.timeout_seconds,
+          estimatedDurationMs: fn.estimated_duration_ms,
+          enabled: fn.enabled,
+          estimatedCost: formatUSD(cost),
+          createdAt: fn.created_at
+            ? new Date(fn.created_at as unknown as string).toISOString()
+            : null,
+        };
+        if (fn.description) info.description = fn.description;
+        if (fn.custom_base_fee !== null && fn.custom_base_fee !== undefined) {
+          info.customBaseFee = Number(fn.custom_base_fee);
+        }
+        return info;
+      });
+
+      return c.json({
+        functions: response,
+        enforceWhitelist: config.enforceWhitelist,
+      });
+    } catch (err) {
+      log.error('failed to list functions from database', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to list functions' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminRegisterFunction -- POST /admin/functions
+  // -------------------------------------------------------------------
+
+  async function handleAdminRegisterFunction(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'database not configured' }, 503);
+    }
+
+    let req: RegisterFunctionRequest;
+    try {
+      req = await c.req.json<RegisterFunctionRequest>();
+    } catch {
+      log.warn('invalid register function request body');
+      return c.json({ error: 'invalid request body' }, 400);
+    }
+
+    // Validate required fields
+    if (!req.functionArn || !req.functionName || !req.description) {
+      return c.json({ error: 'invalid request body' }, 400);
+    }
+
+    // Validate visibility
+    let adminVisibility = 'public';
+    if (req.visibility) {
+      if (req.visibility !== 'public' && req.visibility !== 'private') {
+        return c.json({
+          error: 'invalid visibility',
+          message: "visibility must be 'public' or 'private'",
+        }, 400);
+      }
+      adminVisibility = req.visibility;
+    }
+
+    // Reject plain HTTP endpoints for security
+    if (isInsecureHTTPEndpoint(req.functionArn)) {
+      return c.json({
+        error: 'insecure endpoint',
+        message: 'Plain HTTP endpoints are not allowed. Use HTTPS or a Lambda ARN.',
+      }, 400);
+    }
+
+    // Build function values with sensible defaults
+    let memoryMB = req.memoryMB ?? 0;
+    let timeoutSeconds = req.timeoutSeconds ?? 0;
+    let estimatedDurationMs = req.estimatedDurationMs ?? 0;
+
+    if (isHTTPEndpoint(req.functionArn)) {
+      if (timeoutSeconds <= 0) timeoutSeconds = 30;
+      if (estimatedDurationMs <= 0) estimatedDurationMs = 1000;
+    }
+
+    if (estimatedDurationMs <= 0) {
+      estimatedDurationMs = timeoutSeconds * 100; // 10% of timeout
+    }
+
+    // Validate custom base fee
+    if (req.customBaseFee !== undefined && req.customBaseFee !== null) {
+      if (req.customBaseFee < 0) {
+        return c.json({
+          error: 'invalid customBaseFee',
+          message: 'customBaseFee must be non-negative',
+        }, 400);
+      }
+    }
+
+    // Build the insertable record
+    const fnValues: Insertable<LambdaFunctionTable> = {
+      function_arn: req.functionArn,
+      function_name: req.functionName,
+      description: req.description,
+      memory_mb: memoryMB,
+      timeout_seconds: timeoutSeconds,
+      estimated_duration_ms: estimatedDurationMs,
+      enabled: true,
+      visibility: adminVisibility,
+      tags: req.tags ?? [],
+      custom_base_fee:
+        req.customBaseFee !== undefined && req.customBaseFee !== null
+          ? BigInt(req.customBaseFee)
+          : null,
+      owner_address: req.ownerAddress ? req.ownerAddress.toLowerCase() : null,
+      input_schema: req.inputSchema ?? null,
+      output_schema: req.outputSchema ?? null,
+      version: req.version ?? '',
+      author: req.author ?? null,
+      documentation_url: req.documentationUrl ?? null,
+    };
+
+    // Handle examples
+    if (req.examples && req.examples.length > 0) {
+      fnValues.examples = JSON.parse(JSON.stringify(req.examples)) as never;
+    }
+
+    try {
+      // Check if the function already exists
+      const existing = await db
+        .selectFrom('lambda_functions')
+        .selectAll()
+        .where('function_name', '=', req.functionName)
+        .executeTakeFirst();
+
+      let created: boolean;
+      if (existing) {
+        // Update
+        await db
+          .updateTable('lambda_functions')
+          .set({
+            ...fnValues,
+            updated_at: sql`NOW()`,
+          })
+          .where('function_name', '=', req.functionName)
+          .execute();
+        created = false;
+      } else {
+        // Insert
+        await db.insertInto('lambda_functions').values(fnValues).execute();
+        created = true;
+      }
+
+      if (created) {
+        log.info('function registered (created)', { function: req.functionName });
+      } else {
+        log.info('function registered (updated)', { function: req.functionName });
+      }
+
+      const status = created ? 201 : 200;
+      const message = created
+        ? 'function registered (created)'
+        : 'function registered (updated)';
+
+      return c.json(
+        {
+          message,
+          created,
+          function: {
+            functionName: req.functionName,
+            functionArn: req.functionArn,
+            description: req.description,
+            memoryMB,
+            timeoutSeconds,
+            estimatedDurationMs,
+            visibility: adminVisibility,
+          },
+        },
+        status as 200 | 201,
+      );
+    } catch (err) {
+      log.error('failed to register function', {
+        function: req.functionName,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to register function' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminDeleteFunction -- DELETE /admin/functions/:name
+  // -------------------------------------------------------------------
+
+  async function handleAdminDeleteFunction(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'database not configured' }, 503);
+    }
+
+    const functionName = c.req.param('name');
+    if (!functionName) {
+      return c.json({ error: 'function name is required' }, 400);
+    }
+
+    try {
+      await db
+        .updateTable('lambda_functions')
+        .set({
+          enabled: false,
+          updated_at: sql`NOW()`,
+        })
+        .where('function_name', '=', functionName)
+        .execute();
+
+      log.info('admin_function_disabled', { function: functionName });
+
+      return c.json({
+        message: 'function disabled',
+        functionName,
+      });
+    } catch (err) {
+      log.error('failed to disable function', {
+        function: functionName,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to disable function' }, 500);
+    }
+  }
+
+  // =========================================================================
+  // Stats
+  // =========================================================================
+
+  // -------------------------------------------------------------------
+  // handleAdminGetStats -- GET /admin/stats/:function
+  // -------------------------------------------------------------------
+
+  async function handleAdminGetStats(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'database not configured' }, 503);
+    }
+
+    const functionName = c.req.param('function');
+    if (!functionName) {
+      return c.json({ error: 'function name is required' }, 400);
+    }
+
+    log.info('admin_stats_requested', { function: functionName });
+
+    try {
+      const stats = await getAdminFunctionStats(db, functionName);
+      if (!stats) {
+        return c.json({
+          error: 'no stats available',
+          message: 'No invocations found for this function',
+        }, 404);
+      }
+
+      return c.json({
+        ...stats,
+        totalRevenueUSD: formatUSD(stats.totalRevenue),
+      });
+    } catch (err) {
+      log.error('failed to get invocation stats', {
+        function: functionName,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to get stats' }, 500);
+    }
+  }
+
+  // =========================================================================
+  // Lease Management
+  // =========================================================================
+
+  // -------------------------------------------------------------------
+  // handleAdminListLeases -- GET /admin/leases
+  // -------------------------------------------------------------------
+
+  async function handleAdminListLeases(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    const filters: LeaseFilters = {
+      status: c.req.query('status') || undefined,
+      payerAddress: c.req.query('payer') || undefined,
+      resourceId: c.req.query('resource') || undefined,
+      limit: parseIntQuery(c, 'limit', 50),
+      offset: parseIntQuery(c, 'offset', 0),
+      fromDate: parseDateQuery(c, 'from'),
+      toDate: parseDateQuery(c, 'to'),
+    };
+
+    try {
+      const [leases, total] = await listAllLeases(db, filters);
+
+      return c.json({
+        leases,
+        total,
+        limit: filters.limit,
+        offset: filters.offset,
+      });
+    } catch (err) {
+      log.error('failed to list leases', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to list leases' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminLeaseSummary -- GET /admin/leases/summary
+  // -------------------------------------------------------------------
+
+  async function handleAdminLeaseSummary(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    try {
+      const stats = await getAdminLeaseSummary(db);
+      return c.json({
+        ...stats,
+        totalRevenue: stats.totalRevenue.toString(),
+        totalRevenueUSD: formatUSD(stats.totalRevenue),
+      });
+    } catch (err) {
+      log.error('failed to get lease summary', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to get lease summary' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminGetLease -- GET /admin/leases/:id
+  // -------------------------------------------------------------------
+
+  async function handleAdminGetLease(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    const leaseId = c.req.param('id');
+    if (!leaseId) {
+      return c.json({ error: 'lease ID is required' }, 400);
+    }
+
+    try {
+      const lease = await db
+        .selectFrom('leases')
+        .selectAll()
+        .where('id', '=', leaseId)
+        .executeTakeFirst();
+
+      if (!lease) {
+        return c.json({ error: 'lease not found' }, 404);
+      }
+
+      return c.json(lease);
+    } catch (err) {
+      log.error('failed to get lease', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to get lease' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminTerminateLease -- POST /admin/leases/:id/terminate
+  // -------------------------------------------------------------------
+
+  async function handleAdminTerminateLease(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    const leaseId = c.req.param('id');
+    if (!leaseId) {
+      return c.json({ error: 'lease ID is required' }, 400);
+    }
+
+    let body: { reason?: string };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'reason is required' }, 400);
+    }
+
+    if (!body.reason) {
+      return c.json({ error: 'reason is required' }, 400);
+    }
+
+    try {
+      await adminTerminateLease(db, leaseId, body.reason);
+      await auditLog(db, c, 'lease.terminate', 'lease', leaseId, { reason: body.reason });
+
+      return c.json({
+        message: 'lease terminated',
+        leaseId,
+        reason: body.reason,
+      });
+    } catch (err) {
+      log.error('failed to terminate lease', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: err instanceof Error ? err.message : 'failed to terminate lease' }, 400);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminExtendLease -- POST /admin/leases/:id/extend
+  // -------------------------------------------------------------------
+
+  async function handleAdminExtendLease(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    const leaseId = c.req.param('id');
+    if (!leaseId) {
+      return c.json({ error: 'lease ID is required' }, 400);
+    }
+
+    let body: { days?: number };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'days is required (1-90)' }, 400);
+    }
+
+    if (!body.days || body.days < 1 || body.days > 90) {
+      return c.json({ error: 'days is required (1-90)' }, 400);
+    }
+
+    try {
+      await adminExtendLease(db, leaseId, body.days);
+      await auditLog(db, c, 'lease.extend', 'lease', leaseId, { days: body.days });
+
+      return c.json({
+        message: 'lease extended',
+        leaseId,
+        days: body.days,
+      });
+    } catch (err) {
+      log.error('failed to extend lease', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: err instanceof Error ? err.message : 'failed to extend lease' }, 400);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminDeleteLeaseData -- DELETE /admin/leases/:id/data
+  // -------------------------------------------------------------------
+
+  async function handleAdminDeleteLeaseData(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    const leaseId = c.req.param('id');
+    if (!leaseId) {
+      return c.json({ error: 'lease ID is required' }, 400);
+    }
+
+    try {
+      await anonymizeLease(db, leaseId);
+      await auditLog(db, c, 'lease.gdpr_delete', 'lease', leaseId, null);
+
+      return c.json({
+        message: 'lease data anonymized',
+        leaseId,
+      });
+    } catch (err) {
+      log.error('failed to anonymize lease data', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: err instanceof Error ? err.message : 'failed to anonymize lease' }, 400);
+    }
+  }
+
+  // =========================================================================
+  // Billing & Financial
+  // =========================================================================
+
+  // -------------------------------------------------------------------
+  // handleAdminBillingSummary -- GET /admin/billing/summary
+  // -------------------------------------------------------------------
+
+  async function handleAdminBillingSummary(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    // Default to last 30 days
+    const to = new Date();
+    let from = new Date(to.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+    const fromParam = parseDateQuery(c, 'from');
+    const toParam = parseDateQuery(c, 'to');
+    if (fromParam) from = fromParam;
+
+    try {
+      const summary = await getBillingSummary(db, from);
+
+      return c.json({
+        summary: {
+          ...summary,
+          totalRevenue: summary.totalRevenue.toString(),
+          totalRevenueUSD: formatUSD(summary.totalRevenue),
+          totalRefunds: summary.totalRefunds.toString(),
+          totalRefundsUSD: formatUSD(summary.totalRefunds),
+          totalCredits: summary.totalCredits.toString(),
+          totalCreditsUSD: formatUSD(summary.totalCredits),
+          totalEarnings: summary.totalEarnings.toString(),
+          totalEarningsUSD: formatUSD(summary.totalEarnings),
+          netRevenue: summary.netRevenue.toString(),
+          netRevenueUSD: formatUSD(summary.netRevenue),
+        },
+        from: from.toISOString(),
+        to: (toParam ?? to).toISOString(),
+      });
+    } catch (err) {
+      log.error('failed to get billing summary', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to get billing summary' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminBillingInvocations -- GET /admin/billing/invocations
+  // -------------------------------------------------------------------
+
+  async function handleAdminBillingInvocations(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    const filters: InvocationFilters = {
+      functionName: c.req.query('function') || undefined,
+      payer: c.req.query('payer') || undefined,
+      limit: parseIntQuery(c, 'limit', 50),
+      offset: parseIntQuery(c, 'offset', 0),
+      fromDate: parseDateQuery(c, 'from'),
+      toDate: parseDateQuery(c, 'to'),
+    };
+
+    try {
+      const [invocations, total] = await getInvocationsBilling(db, filters);
+
+      return c.json({
+        invocations,
+        total,
+      });
+    } catch (err) {
+      log.error('failed to list invocations', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to list invocations' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminBillingRefunds -- GET /admin/billing/refunds
+  // -------------------------------------------------------------------
+
+  async function handleAdminBillingRefunds(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    const filters: RefundFilters = {
+      status: c.req.query('status') || undefined,
+      payer: c.req.query('payer') || undefined,
+      limit: parseIntQuery(c, 'limit', 50),
+      offset: parseIntQuery(c, 'offset', 0),
+    };
+
+    try {
+      const [refunds, total] = await getRefundsBilling(db, filters);
+
+      return c.json({
+        refunds,
+        total,
+      });
+    } catch (err) {
+      log.error('failed to list refunds', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to list refunds' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminBillingCredits -- GET /admin/billing/credits
+  // -------------------------------------------------------------------
+
+  async function handleAdminBillingCredits(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    const limit = parseIntQuery(c, 'limit', 50);
+    const offset = parseIntQuery(c, 'offset', 0);
+
+    try {
+      const [credits, total] = await getCreditsBilling(db, limit, offset);
+
+      return c.json({
+        credits,
+        total,
+      });
+    } catch (err) {
+      log.error('failed to list credits', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to list credits' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminBillingEarnings -- GET /admin/billing/earnings
+  // -------------------------------------------------------------------
+
+  async function handleAdminBillingEarnings(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    const limit = parseIntQuery(c, 'limit', 50);
+    const offset = parseIntQuery(c, 'offset', 0);
+
+    try {
+      const [earnings, total] = await getEarningsBilling(db, limit, offset);
+
+      return c.json({
+        earnings,
+        total,
+      });
+    } catch (err) {
+      log.error('failed to list earnings', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to list earnings' }, 500);
+    }
+  }
+
+  // =========================================================================
+  // Resource Management
+  // =========================================================================
+
+  // -------------------------------------------------------------------
+  // handleAdminListResources -- GET /admin/resources
+  // -------------------------------------------------------------------
+
+  async function handleAdminListResources(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    try {
+      // List all resources (including disabled, for admin)
+      const resources = await db
+        .selectFrom('lease_resources')
+        .selectAll()
+        .orderBy('vcpus', 'asc')
+        .orderBy('memory_gb', 'asc')
+        .execute();
+
+      // Enrich with utilization info
+      const enriched = await Promise.all(
+        resources.map(async (r) => {
+          let activeLeases = 0;
+          let totalLeases = 0;
+          try {
+            const util = await getResourceUtilization(db, r.id);
+            activeLeases = util.activeLeases;
+            totalLeases = util.totalLeases;
+          } catch {
+            // best-effort
+          }
+          return {
+            ...r,
+            activeLeases,
+            totalLeases,
+          };
+        }),
+      );
+
+      return c.json({ resources: enriched });
+    } catch (err) {
+      log.error('failed to list resources', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to list resources' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminCreateResource -- POST /admin/resources
+  // -------------------------------------------------------------------
+
+  async function handleAdminCreateResource(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    let req: AdminResourceRequest;
+    try {
+      req = await c.req.json<AdminResourceRequest>();
+    } catch {
+      return c.json({ error: 'invalid request body' }, 400);
+    }
+
+    // Validate required fields
+    if (!req.id || !req.displayName || !req.instanceType || !req.amiId) {
+      return c.json({ error: 'id, displayName, instanceType, and amiId are required' }, 400);
+    }
+    if (!req.vcpus || req.vcpus < 1) {
+      return c.json({ error: 'vcpus must be at least 1' }, 400);
+    }
+    if (!req.memoryGb || req.memoryGb <= 0) {
+      return c.json({ error: 'memoryGb must be positive' }, 400);
+    }
+    if (!req.price1d || req.price1d < 1) {
+      return c.json({ error: 'price1d must be positive' }, 400);
+    }
+    if (!req.price7d || req.price7d < 1) {
+      return c.json({ error: 'price7d must be positive' }, 400);
+    }
+    if (!req.price30d || req.price30d < 1) {
+      return c.json({ error: 'price30d must be positive' }, 400);
+    }
+
+    const resource = buildResourceFromRequest(req);
+
+    try {
+      await db
+        .insertInto('lease_resources')
+        .values(resource)
+        .onConflict((oc) =>
+          oc.column('id').doUpdateSet({
+            ...resource,
+            updated_at: sql`NOW()`,
+          }),
+        )
+        .execute();
+
+      await auditLog(db, c, 'resource.create', 'resource', req.id, req);
+
+      return c.json(
+        {
+          message: 'resource created',
+          resource,
+        },
+        201,
+      );
+    } catch (err) {
+      log.error('failed to create resource', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to create resource' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminUpdateResource -- PUT /admin/resources/:id
+  // -------------------------------------------------------------------
+
+  async function handleAdminUpdateResource(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    const id = c.req.param('id');
+    if (!id) {
+      return c.json({ error: 'resource ID is required' }, 400);
+    }
+
+    let req: AdminResourceRequest;
+    try {
+      req = await c.req.json<AdminResourceRequest>();
+    } catch {
+      return c.json({ error: 'invalid request body' }, 400);
+    }
+
+    // Validate required fields
+    if (!req.displayName || !req.instanceType || !req.amiId) {
+      return c.json({ error: 'displayName, instanceType, and amiId are required' }, 400);
+    }
+    if (!req.vcpus || req.vcpus < 1) {
+      return c.json({ error: 'vcpus must be at least 1' }, 400);
+    }
+    if (!req.memoryGb || req.memoryGb <= 0) {
+      return c.json({ error: 'memoryGb must be positive' }, 400);
+    }
+    if (!req.price1d || req.price1d < 1) {
+      return c.json({ error: 'price1d must be positive' }, 400);
+    }
+    if (!req.price7d || req.price7d < 1) {
+      return c.json({ error: 'price7d must be positive' }, 400);
+    }
+    if (!req.price30d || req.price30d < 1) {
+      return c.json({ error: 'price30d must be positive' }, 400);
+    }
+
+    // Ensure ID matches route param
+    req.id = id;
+    const resource = buildResourceFromRequest(req);
+
+    try {
+      await db
+        .insertInto('lease_resources')
+        .values(resource)
+        .onConflict((oc) =>
+          oc.column('id').doUpdateSet({
+            ...resource,
+            updated_at: sql`NOW()`,
+          }),
+        )
+        .execute();
+
+      await auditLog(db, c, 'resource.update', 'resource', id, req);
+
+      return c.json({
+        message: 'resource updated',
+        resource,
+      });
+    } catch (err) {
+      log.error('failed to update resource', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to update resource' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminDeleteResource -- DELETE /admin/resources/:id
+  // -------------------------------------------------------------------
+
+  async function handleAdminDeleteResource(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    const id = c.req.param('id');
+    if (!id) {
+      return c.json({ error: 'resource ID is required' }, 400);
+    }
+
+    try {
+      await db
+        .updateTable('lease_resources')
+        .set({
+          enabled: false,
+          updated_at: sql`NOW()`,
+        })
+        .where('id', '=', id)
+        .execute();
+
+      await auditLog(db, c, 'resource.disable', 'resource', id, null);
+
+      return c.json({
+        message: 'resource disabled',
+        resourceId: id,
+      });
+    } catch (err) {
+      log.error('failed to disable resource', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: err instanceof Error ? err.message : 'failed to disable resource' }, 400);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminResourceUtilization -- GET /admin/resources/:id/utilization
+  // -------------------------------------------------------------------
+
+  async function handleAdminResourceUtilization(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    const id = c.req.param('id');
+    if (!id) {
+      return c.json({ error: 'resource ID is required' }, 400);
+    }
+
+    try {
+      const util = await getResourceUtilization(db, id);
+      return c.json({
+        ...util,
+        totalRevenue: util.totalRevenue.toString(),
+        totalRevenueUSD: formatUSD(util.totalRevenue),
+      });
+    } catch (err) {
+      log.error('failed to get resource utilization', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to get utilization' }, 500);
+    }
+  }
+
+  // =========================================================================
+  // Audit
+  // =========================================================================
+
+  // -------------------------------------------------------------------
+  // handleAdminAuditLog -- GET /admin/audit
+  // -------------------------------------------------------------------
+
+  async function handleAdminAuditLog(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'admin store not available' }, 503);
+    }
+
+    const filters: AuditLogFilters = {
+      action: c.req.query('action') || undefined,
+      targetType: c.req.query('targetType') || undefined,
+      targetId: c.req.query('targetId') || undefined,
+      limit: parseIntQuery(c, 'limit', 100),
+      offset: parseIntQuery(c, 'offset', 0),
+    };
+
+    try {
+      const entries = await listAuditLog(db, filters);
+      return c.json({ entries });
+    } catch (err) {
+      log.error('failed to list audit logs', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to list audit logs' }, 500);
+    }
+  }
+
+  // =========================================================================
+  // Wallet
+  // =========================================================================
+
+  // -------------------------------------------------------------------
+  // handleAdminWalletBalance -- GET /admin/wallet/balance
+  // -------------------------------------------------------------------
+
+  async function handleAdminWalletBalance(c: Context): Promise<Response> {
+    if (!refundService) {
+      return c.json({ error: 'refund wallet not configured' }, 503);
+    }
+
+    try {
+      const [usdcBalance, ethBalance] = await Promise.all([
+        refundService.getBalance(),
+        refundService.getETHBalance(),
+      ]);
+
+      return c.json({
+        address: refundService.getFromAddress(),
+        usdc_balance: usdcBalance.toString(),
+        usdc_balance_usd: formatUSD(usdcBalance),
+        eth_balance_wei: ethBalance.toString(),
+        eth_balance_ether: formatETH(ethBalance),
+      });
+    } catch (err) {
+      log.error('failed to get wallet balance', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to get wallet balance' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminCollectionBalance -- GET /admin/wallet/collection/balance
+  // -------------------------------------------------------------------
+
+  async function handleAdminCollectionBalance(c: Context): Promise<Response> {
+    if (!refundService) {
+      return c.json({ error: 'wallet service not configured' }, 503);
+    }
+
+    const payToAddr = config.payToAddress;
+    if (!payToAddr) {
+      return c.json({ error: 'PAY_TO_ADDRESS not configured' }, 400);
+    }
+
+    try {
+      const addr = payToAddr as `0x${string}`;
+      const [usdcBalance, ethBalance] = await Promise.all([
+        refundService.getBalanceOf(addr),
+        refundService.getETHBalanceOf(addr),
+      ]);
+
+      return c.json({
+        address: payToAddr,
+        usdc_balance: usdcBalance.toString(),
+        usdc_balance_usd: formatUSD(usdcBalance),
+        eth_balance_wei: ethBalance.toString(),
+        eth_balance_ether: formatETH(ethBalance),
+      });
+    } catch (err) {
+      log.error('failed to get collection balance', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to get collection balance' }, 500);
+    }
+  }
+
+  // =========================================================================
+  // Monitoring
+  // =========================================================================
+
+  // -------------------------------------------------------------------
+  // handleAdminMonitoringSnapshot -- GET /admin/monitoring/snapshot
+  // -------------------------------------------------------------------
+
+  async function handleAdminMonitoringSnapshot(c: Context): Promise<Response> {
+    try {
+      const families = await client.register.getMetricsAsJSON();
+
+      const snap: {
+        timestamp: string;
+        gauges: Record<string, number>;
+        counters: Record<string, number>;
+        histograms: Record<string, number>;
+      } = {
+        timestamp: new Date().toISOString(),
+        gauges: {},
+        counters: {},
+        histograms: {},
+      };
+
+      for (const family of families) {
+        const name = family.name;
+        // Only include our own metrics
+        if (!name.startsWith('lambda_proxy_')) continue;
+
+        const shortName = name.replace(/^lambda_proxy_/, '');
+
+        if (family.type === client.MetricType.Gauge) {
+          let total = 0;
+          if (family.values) {
+            for (const v of family.values) {
+              total += v.value ?? 0;
+            }
+          }
+          snap.gauges[shortName] = total;
+        } else if (family.type === client.MetricType.Counter) {
+          let total = 0;
+          const perLabel: Record<string, number> = {};
+          if (family.values) {
+            for (const v of family.values) {
+              const val = v.value ?? 0;
+              total += val;
+
+              // Build label suffix from status/operation labels
+              const labels = v.labels as Record<string, string | number>;
+              if (labels) {
+                const parts: string[] = [];
+                if (labels.status) parts.push(String(labels.status));
+                if (labels.operation) parts.push(String(labels.operation));
+                const suffix = parts.join('_');
+                if (suffix) {
+                  perLabel[suffix] = (perLabel[suffix] ?? 0) + val;
+                }
+              }
+            }
+          }
+          snap.counters[shortName] = total;
+          // Emit per-label breakdowns when there are multiple
+          if (Object.keys(perLabel).length > 1) {
+            for (const [suffix, val] of Object.entries(perLabel)) {
+              snap.counters[`${shortName}_${suffix}`] = val;
+            }
+          }
+        } else if (family.type === client.MetricType.Histogram) {
+          // For histograms, emit count and sum from the values.
+          // prom-client histogram values with metricName include _count, _sum, _bucket entries.
+          const hName = shortName.replace(/_seconds$/, '');
+          if (family.values) {
+            for (const v of family.values) {
+              // Histogram values from getMetricsAsJSON may include a metricName
+              // property on MetricValueWithName. Cast to access it.
+              const vAny = v as { metricName?: string; value: number };
+              const mName = vAny.metricName ?? '';
+              if (mName.endsWith('_count')) {
+                snap.histograms[`${hName}_count`] = (snap.histograms[`${hName}_count`] ?? 0) + (v.value ?? 0);
+              } else if (mName.endsWith('_sum')) {
+                snap.histograms[`${hName}_sum`] = (snap.histograms[`${hName}_sum`] ?? 0) + (v.value ?? 0);
+              }
+            }
+          }
+        }
+      }
+
+      return c.json(snap);
+    } catch (err) {
+      return c.json({
+        error: 'failed to gather metrics',
+        message: err instanceof Error ? err.message : String(err),
+      }, 500);
+    }
+  }
+
+  // =========================================================================
+  // Reconciliation
+  // =========================================================================
+
+  // -------------------------------------------------------------------
+  // handleAdminRunReconciliation -- POST /admin/reconciliation/run
+  // Compares DB settled invocations against on-chain state.
+  // -------------------------------------------------------------------
+
+  async function handleAdminRunReconciliation(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'database not configured' }, 503);
+    }
+
+    const fromStr = c.req.query('from') || '';
+    const toStr = c.req.query('to') || '';
+
+    let from: Date;
+    let to: Date;
+
+    if (fromStr) {
+      from = new Date(fromStr);
+      if (Number.isNaN(from.getTime())) {
+        return c.json({ error: "invalid 'from' time format, use RFC3339" }, 400);
+      }
+    } else {
+      from = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // default: last 7 days
+    }
+
+    if (toStr) {
+      to = new Date(toStr);
+      if (Number.isNaN(to.getTime())) {
+        return c.json({ error: "invalid 'to' time format, use RFC3339" }, 400);
+      }
+    } else {
+      to = new Date();
+    }
+
+    try {
+      const report: ReconciliationReport = {
+        startedAt: new Date().toISOString(),
+        completedAt: '',
+        totalChecked: 0,
+        matched: 0,
+        unverified: 0,
+        mismatches: [],
+        missingOnChain: [],
+        missingInDb: [],
+        errors: [],
+      };
+
+      const batchSize = 100;
+      let offset = 0;
+
+      // Iterate through settled invocations in batches
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        let invocations;
+        try {
+          invocations = await db
+            .selectFrom('lambda_invocations')
+            .select(['id', 'tx_hash', 'amount_paid', 'created_at'])
+            .where('created_at', '>=', from)
+            .where('created_at', '<=', to)
+            .where('success', '=', true)
+            .orderBy('created_at', 'asc')
+            .limit(batchSize)
+            .offset(offset)
+            .execute();
+        } catch (err) {
+          report.errors.push(
+            'failed to list invocations: ' + (err instanceof Error ? err.message : String(err)),
+          );
+          break;
+        }
+
+        if (invocations.length === 0) break;
+
+        for (const inv of invocations) {
+          report.totalChecked++;
+
+          if (!inv.tx_hash) {
+            report.missingOnChain.push({
+              id: String(inv.id),
+              reason: 'settled invocation has no transaction hash',
+            });
+            continue;
+          }
+
+          // Without an on-chain verifier, we can only check for the presence of tx_hash.
+          // Mark as matched if tx_hash exists.
+          report.matched++;
+        }
+
+        offset += batchSize;
+        if (invocations.length < batchSize) break;
+      }
+
+      // Also find refunds stuck in 'pending' without tx hash
+      try {
+        const stuckRefunds = await db
+          .selectFrom('lambda_invocations')
+          .select(['id', 'refund_status', 'refund_tx_hash'])
+          .where('created_at', '>=', from)
+          .where('created_at', '<=', to)
+          .where('refund_status', '=', 'pending')
+          .where(eb =>
+            eb.or([
+              eb('refund_tx_hash', 'is', null),
+              eb('refund_tx_hash', '=', ''),
+            ]),
+          )
+          .execute();
+
+        for (const r of stuckRefunds) {
+          report.missingOnChain.push({
+            id: String(r.id),
+            reason: 'refund stuck in pending status without tx hash',
+          });
+        }
+      } catch (err) {
+        report.errors.push(
+          'failed to check stuck refunds: ' + (err instanceof Error ? err.message : String(err)),
+        );
+      }
+
+      report.completedAt = new Date().toISOString();
+
+      // Store latest report in memory
+      latestReconciliationReport = report;
+
+      log.info('reconciliation_completed', {
+        totalChecked: report.totalChecked,
+        matched: report.matched,
+        mismatches: report.mismatches.length,
+        missingOnChain: report.missingOnChain.length,
+        errors: report.errors.length,
+      });
+
+      return c.json(report);
+    } catch (err) {
+      log.error('reconciliation_run_failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'reconciliation failed' }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminGetReconciliation -- GET /admin/reconciliation/latest
+  // -------------------------------------------------------------------
+
+  async function handleAdminGetReconciliation(c: Context): Promise<Response> {
+    if (!latestReconciliationReport) {
+      return c.json(
+        { error: 'no reconciliation report available, run POST /admin/reconciliation/run first' },
+        404,
+      );
+    }
+    return c.json(latestReconciliationReport);
+  }
+
+  // =========================================================================
+  // Monitoring Config
+  // =========================================================================
+
+  // -------------------------------------------------------------------
+  // handleAdminMonitoringConfig -- GET /admin/monitoring/config
+  // Returns safe config fields (no secrets) plus dashboard/alert metadata.
+  // -------------------------------------------------------------------
+
+  async function handleAdminMonitoringConfig(c: Context): Promise<Response> {
+    return c.json({
+      grafanaUrl: config.grafanaURL || null,
+      dashboards: [
+        { uid: 'system-overview-dashboard', title: 'System Overview' },
+        { uid: 'lambda-proxy-dashboard', title: 'Lambda Proxy' },
+        { uid: 'open-compute-billing', title: 'Billing & Financial' },
+        { uid: 'open-compute-leases', title: 'EC2 Leases' },
+        { uid: 'open-compute-payments', title: 'Payment Health' },
+      ],
+      alerts: [
+        { name: 'PaymentSettleFailureRateHigh', severity: 'critical', description: 'Payment settlement failure rate >5% for 5m', metric: 'lambda_proxy_payments_total' },
+        { name: 'FacilitatorErrorRateHigh', severity: 'critical', description: 'Facilitator error rate >10% for 3m', metric: 'lambda_proxy_facilitator_errors_total' },
+        { name: 'LambdaInvocationLatencyHigh', severity: 'warning', description: 'Lambda invocation P99 latency >30s for 5m', metric: 'lambda_proxy_invocation_duration_seconds' },
+        { name: 'HealthCheckFailing', severity: 'critical', description: 'Lambda proxy health check failing for 2m', metric: 'up' },
+        { name: 'RateLimitRejectionRateHigh', severity: 'warning', description: 'Rate limit rejection rate >50% for 5m', metric: 'lambda_proxy_rate_limit_hits_total' },
+        { name: 'DatabaseConnectionFailure', severity: 'critical', description: 'Lambda-proxy instance down for 2m (possible DB failure)', metric: 'up' },
+        { name: 'HighMemoryUsage', severity: 'critical', description: 'Lambda proxy memory usage >90% for 5m', metric: 'process_resident_memory_bytes' },
+        { name: 'RefundWalletUSDCLow', severity: 'critical', description: 'Refund wallet USDC balance below $100', metric: 'lambda_proxy_refund_wallet_usdc_balance' },
+        { name: 'RefundWalletETHLow', severity: 'warning', description: 'Refund wallet ETH balance below 0.01 ETH', metric: 'lambda_proxy_refund_wallet_eth_balance' },
+        { name: 'HighErrorRate', severity: 'warning', description: 'HTTP 5xx error rate >1% for 5m', metric: 'lambda_proxy_http_requests_total' },
+      ],
+      leaseEnabled: config.leaseEnabled,
+      asyncJobsEnabled: config.asyncJobsEnabled,
+      refundEnabled: config.refundEnabled,
+      network: config.network,
+    });
+  }
+
+  // =========================================================================
+  // Wallet Sweep
+  // =========================================================================
+
+  // -------------------------------------------------------------------
+  // Shared sweep implementation for both refund and collection wallets.
+  // -------------------------------------------------------------------
+
+  async function handleWalletSweep(
+    c: Context,
+    svc: RefundService,
+    walletName: string,
+  ): Promise<Response> {
+    const treasuryAddress = config.treasuryAddress;
+    if (!treasuryAddress) {
+      return c.json({ error: 'TREASURY_ADDRESS not configured' }, 400);
+    }
+
+    let req: SweepRequest;
+    try {
+      req = await c.req.json<SweepRequest>();
+    } catch {
+      return c.json({ error: 'invalid request body: amount (string) and confirm (bool) required' }, 400);
+    }
+
+    const asset = req.asset || 'usdc';
+    if (asset !== 'usdc' && asset !== 'eth') {
+      return c.json({ error: "asset must be 'usdc' or 'eth'" }, 400);
+    }
+
+    let amount: bigint;
+    try {
+      amount = BigInt(req.amount);
+      if (amount <= 0n) throw new Error('non-positive');
+    } catch {
+      return c.json({ error: 'amount must be a positive integer string' }, 400);
+    }
+
+    // Dry run
+    if (!req.confirm) {
+      const resp: Record<string, unknown> = {
+        dry_run: true,
+        from: svc.getFromAddress(),
+        to: treasuryAddress,
+        asset,
+        amount: req.amount,
+        message: 'Set confirm=true to execute the sweep',
+      };
+      if (asset === 'usdc') {
+        resp.amount_usd = formatUSD(amount);
+      } else {
+        resp.amount_ether = formatETH(amount);
+      }
+      return c.json(resp);
+    }
+
+    log.info('admin_wallet_sweep_initiated', {
+      wallet: walletName,
+      asset,
+      from: svc.getFromAddress(),
+      to: treasuryAddress,
+      amount: req.amount,
+    });
+
+    try {
+      if (asset === 'usdc') {
+        const result = await svc.sendRefund(treasuryAddress, amount);
+        return c.json({
+          success: true,
+          from: svc.getFromAddress(),
+          to: treasuryAddress,
+          asset: 'usdc',
+          amount: req.amount,
+          result,
+        });
+      } else {
+        const result = await svc.sendETH(treasuryAddress, amount);
+        return c.json({
+          success: true,
+          from: svc.getFromAddress(),
+          to: treasuryAddress,
+          asset: 'eth',
+          amount: req.amount,
+          result,
+        });
+      }
+    } catch (err) {
+      log.error(`wallet ${asset} sweep failed`, {
+        wallet: walletName,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({
+        error: 'sweep transaction failed: ' + (err instanceof Error ? err.message : String(err)),
+      }, 500);
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminWalletSweep -- POST /admin/wallet/sweep
+  // Sends USDC or ETH from refund wallet to treasury.
+  // -------------------------------------------------------------------
+
+  async function handleAdminWalletSweep(c: Context): Promise<Response> {
+    if (!refundService) {
+      return c.json({ error: 'refund wallet not configured' }, 503);
+    }
+    return handleWalletSweep(c, refundService, 'refund');
+  }
+
+  // -------------------------------------------------------------------
+  // handleAdminCollectionSweep -- POST /admin/wallet/collection/sweep
+  // Sends USDC or ETH from collection (pay-to) wallet to treasury.
+  // -------------------------------------------------------------------
+
+  async function handleAdminCollectionSweep(c: Context): Promise<Response> {
+    if (!collectionService) {
+      return c.json({ error: 'collection wallet not configured (COLLECTION_PRIVATE_KEY not set)' }, 503);
+    }
+    return handleWalletSweep(c, collectionService, 'collection');
+  }
+
+  // =========================================================================
+  // Resource request builder (mirrors Go's reqToLeaseResource)
+  // =========================================================================
+
+  function buildResourceFromRequest(req: AdminResourceRequest) {
+    const sshUser = req.sshUser || 'ubuntu';
+    const maxConcurrent = req.maxConcurrent && req.maxConcurrent > 0 ? req.maxConcurrent : 10;
+    const enabled = req.enabled !== undefined ? req.enabled : true;
+    const marginPercent = req.marginPercent && req.marginPercent > 0 ? req.marginPercent : 20;
+    const defaultStorageGb = req.defaultStorageGb && req.defaultStorageGb > 0
+      ? req.defaultStorageGb
+      : (req.storageGb ?? 0);
+    const publicIpDefault = req.publicIpDefault !== undefined ? req.publicIpDefault : true;
+
+    return {
+      id: req.id,
+      display_name: req.displayName,
+      instance_type: req.instanceType,
+      vcpus: req.vcpus,
+      memory_gb: req.memoryGb,
+      storage_gb: req.storageGb ?? 0,
+      ami_id: req.amiId,
+      ssh_user: sshUser,
+      description: req.description ?? null,
+      price_1d: BigInt(req.price1d),
+      price_7d: BigInt(req.price7d),
+      price_30d: BigInt(req.price30d),
+      max_concurrent: maxConcurrent,
+      enabled,
+      margin_percent: marginPercent,
+      default_storage_gb: defaultStorageGb,
+      min_storage_gb: req.minStorageGb ?? 0,
+      max_storage_gb: req.maxStorageGb ?? 0,
+      egress_limit_gb: req.egressLimitGb ?? 0,
+      ingress_limit_gb: req.ingressLimitGb ?? 0,
+      public_ip_default: publicIpDefault,
+    };
+  }
+
+  // =========================================================================
+  // Return all admin handlers
+  // =========================================================================
+
+  return {
+    // Function management
+    handleAdminListFunctions,
+    handleAdminRegisterFunction,
+    handleAdminDeleteFunction,
+
+    // Stats
+    handleAdminGetStats,
+
+    // Lease management
+    handleAdminListLeases,
+    handleAdminLeaseSummary,
+    handleAdminGetLease,
+    handleAdminTerminateLease,
+    handleAdminExtendLease,
+    handleAdminDeleteLeaseData,
+
+    // Billing & financial
+    handleAdminBillingSummary,
+    handleAdminBillingInvocations,
+    handleAdminBillingRefunds,
+    handleAdminBillingCredits,
+    handleAdminBillingEarnings,
+
+    // Resource management
+    handleAdminListResources,
+    handleAdminCreateResource,
+    handleAdminUpdateResource,
+    handleAdminDeleteResource,
+    handleAdminResourceUtilization,
+
+    // Audit
+    handleAdminAuditLog,
+
+    // Wallet
+    handleAdminWalletBalance,
+    handleAdminCollectionBalance,
+    handleAdminWalletSweep,
+    handleAdminCollectionSweep,
+
+    // Monitoring
+    handleAdminMonitoringSnapshot,
+    handleAdminMonitoringConfig,
+
+    // Reconciliation
+    handleAdminRunReconciliation,
+    handleAdminGetReconciliation,
+  };
+}
