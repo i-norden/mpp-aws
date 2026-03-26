@@ -1,4 +1,4 @@
-# mmp-aws
+# mpp-aws
 
 Pay-per-use AWS compute marketplace powered by [MPP](https://github.com/tempoxyz/mpp) (Machine Payments Protocol). Clients pay for Lambda invocations and EC2 leases with USDC via the HTTP 402 flow.
 
