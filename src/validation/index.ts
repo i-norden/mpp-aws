@@ -24,6 +24,10 @@ export function validateFunctionName(name: string): void {
   }
 }
 
+export function isValidEthAddress(address: string): boolean {
+  return ETH_ADDRESS_REGEX.test(address);
+}
+
 export function validateEthAddress(address: string, field: string): void {
   if (!address) {
     throw new ValidationError(field, `${field} is required`);

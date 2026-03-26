@@ -73,7 +73,7 @@ async function requireAddressOwnership(
       error: 'authentication required',
       message: 'X-Wallet-Address, X-Wallet-Signature, and X-Wallet-Message headers are required',
       hint: "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet",
-    }, 401) as unknown as Response;
+    }, 401);
     return null;
   }
 
@@ -82,7 +82,7 @@ async function requireAddressOwnership(
     c.res = jsonWithStatus(c, {
       error: 'authentication failed',
       message: result.errorMessage,
-    }, result.statusCode ?? 401) as unknown as Response;
+    }, result.statusCode ?? 401);
     return null;
   }
 

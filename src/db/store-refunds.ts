@@ -134,3 +134,99 @@ export async function getRefundBySourceTxHash(
 
   return row ?? null;
 }
+
+/**
+ * List refunds for a payer address, ordered by creation time descending.
+ */
+export async function listRefunds(
+  db: Kysely<Database>,
+  payerAddress: string,
+  limit: number,
+  offset: number,
+): Promise<Refund[]> {
+  return db
+    .selectFrom("refunds")
+    .selectAll()
+    .where("payer_address", "=", payerAddress)
+    .orderBy("created_at", "desc")
+    .limit(limit)
+    .offset(offset)
+    .execute();
+}
+
+/**
+ * List pending refunds that have a tx_hash (sent but not yet confirmed).
+ * Used for monitoring the refund pipeline.
+ */
+export async function listPendingRefunds(
+  db: Kysely<Database>,
+  limit: number,
+): Promise<Refund[]> {
+  return db
+    .selectFrom("refunds")
+    .selectAll()
+    .where("status", "=", "pending")
+    .where("refund_tx_hash", "is not", null)
+    .orderBy("created_at", "asc")
+    .limit(limit)
+    .execute();
+}
+
+/**
+ * List pending refunds WITHOUT a tx_hash that are older than the given
+ * threshold in minutes. These are "stuck" refunds that were never sent
+ * on-chain and need recovery.
+ */
+export async function listStuckPendingRefunds(
+  db: Kysely<Database>,
+  olderThanMinutes: number,
+  limit: number,
+): Promise<Refund[]> {
+  const rows = await sql<Refund>`
+    SELECT * FROM refunds
+    WHERE status = 'pending'
+      AND refund_tx_hash IS NULL
+      AND created_at < NOW() - MAKE_INTERVAL(mins => ${olderThanMinutes})
+    ORDER BY created_at ASC
+    LIMIT ${limit}
+  `.execute(db);
+
+  return rows.rows;
+}
+
+/**
+ * Count pending refunds without a tx_hash (stuck refunds).
+ * Used as a Prometheus gauge for alerting.
+ */
+export async function countStuckPendingRefunds(
+  db: Kysely<Database>,
+): Promise<number> {
+  const row = await sql<{ count: string }>`
+    SELECT COUNT(*) AS count FROM refunds
+    WHERE status = 'pending' AND refund_tx_hash IS NULL
+  `.execute(db);
+
+  return Number(row.rows[0]?.count ?? 0);
+}
+
+/**
+ * Find pending refunds WITH a tx_hash that are older than the given threshold.
+ * These may have been sent on-chain but never confirmed in the DB.
+ * The recovery worker should re-check their receipt status.
+ */
+export async function listSentButUnconfirmedRefunds(
+  db: Kysely<Database>,
+  olderThanMinutes: number,
+  limit: number,
+): Promise<Refund[]> {
+  const rows = await sql<Refund>`
+    SELECT * FROM refunds
+    WHERE status = 'pending'
+      AND refund_tx_hash IS NOT NULL
+      AND created_at < NOW() - MAKE_INTERVAL(mins => ${olderThanMinutes})
+    ORDER BY created_at ASC
+    LIMIT ${limit}
+  `.execute(db);
+
+  return rows.rows;
+}

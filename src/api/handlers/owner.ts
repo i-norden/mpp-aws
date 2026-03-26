@@ -125,7 +125,7 @@ async function verifyOwnership(
       error: 'authentication required',
       message: 'X-Signature and X-Message headers are required',
       hint: "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet",
-    }, 401) as unknown as Response;
+    }, 401);
     return false;
   }
 
@@ -134,7 +134,7 @@ async function verifyOwnership(
     c.res = jsonWithStatus(c, {
       error: 'authentication failed',
       message: result.errorMessage,
-    }, result.statusCode ?? 401) as unknown as Response;
+    }, result.statusCode ?? 401);
     return false;
   }
 
@@ -153,7 +153,7 @@ async function verifyFunctionOwnership(
   const rawName = c.req.param('name') ?? '';
   const functionName = normalizeFunctionName(rawName);
   if (!functionName) {
-    c.res = c.json({ error: 'function name is required' }, 400) as unknown as Response;
+    c.res = c.json({ error: 'function name is required' }, 400);
     return null;
   }
 
@@ -169,17 +169,17 @@ async function verifyFunctionOwnership(
       function: functionName,
       error: err instanceof Error ? err.message : String(err),
     });
-    c.res = c.json({ error: 'failed to look up function' }, 500) as unknown as Response;
+    c.res = c.json({ error: 'failed to look up function' }, 500);
     return null;
   }
 
   if (!fn) {
-    c.res = c.json({ error: 'function not found' }, 404) as unknown as Response;
+    c.res = c.json({ error: 'function not found' }, 404);
     return null;
   }
 
   if (!fn.owner_address) {
-    c.res = c.json({ error: 'function has no owner' }, 403) as unknown as Response;
+    c.res = c.json({ error: 'function has no owner' }, 403);
     return null;
   }
 

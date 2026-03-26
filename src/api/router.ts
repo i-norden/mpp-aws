@@ -35,6 +35,10 @@ import {
 } from '../ratelimit/middleware.js';
 import { createRateLimiter } from '../ratelimit/factory.js';
 
+// Error handling
+import { HttpError, ErrorCodes, errorResponse } from './errors.js';
+import * as log from '../logging/index.js';
+
 // Handlers
 import { createHealthHandlers } from './handlers/health.js';
 import { createInvokeHandlers } from './handlers/invoke.js';
@@ -129,6 +133,25 @@ export function createRouter(deps: RouterDeps): Hono {
   const { config: cfg } = deps;
 
   const app = new Hono();
+
+  // =========================================================================
+  // Global error handler — catches unhandled exceptions and returns a
+  // standardised JSON error response so clients never receive raw stack traces.
+  // =========================================================================
+
+  app.onError((err, c) => {
+    if (err instanceof HttpError) {
+      return errorResponse(c, err.status, ErrorCodes.INVALID_REQUEST, err.message, err.details);
+    }
+    log.error('unhandled error', {
+      error: err.message,
+      stack: err.stack,
+      requestId: c.req.header('X-Request-Id') ?? '',
+      path: c.req.path,
+      method: c.req.method,
+    });
+    return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'An internal error occurred');
+  });
 
   // =========================================================================
   // Global middleware
@@ -331,6 +354,7 @@ export function createRouter(deps: RouterDeps): Hono {
   app.get('/credits/:address', creditRateLimit, creditsHandlers.handleGetCredits);
   app.get('/credits/:address/history', creditRateLimit, creditsHandlers.handleListCredits);
   app.post('/credits/:address/redeem', creditRateLimit, creditsHandlers.handleRedeemCredits);
+  app.post('/credits/:address/voucher', creditRateLimit, creditsHandlers.handleRedeemVoucher);
 
   // =========================================================================
   // Function access management (owner-authenticated)
@@ -462,6 +486,11 @@ export function createRouter(deps: RouterDeps): Hono {
     app.get('/admin/wallet/collection/balance', adminRateLimit, adminAuth, adminHandlers.handleAdminCollectionBalance);
     app.post('/admin/wallet/sweep', adminRateLimit, adminAuth, adminHandlers.handleAdminWalletSweep);
     app.post('/admin/wallet/collection/sweep', adminRateLimit, adminAuth, adminHandlers.handleAdminCollectionSweep);
+
+    // GDPR & Data Retention
+    app.post('/admin/gdpr/delete', adminRateLimit, adminAuth, adminHandlers.handleAdminGDPRDelete);
+    app.get('/admin/monitoring/table-sizes', adminRateLimit, adminAuth, adminHandlers.handleAdminTableSizes);
+    app.post('/admin/retention/run', adminRateLimit, adminAuth, adminHandlers.handleAdminRunRetention);
   }
 
   return app;

@@ -6,12 +6,18 @@ import type { Config } from '../config/index.js';
 import { cleanupExpiredAuthNonces } from '../db/store-auth-nonces.js';
 import { cleanupExpiredNonces } from '../db/store-nonces.js';
 import { expireBudgets } from '../db/store-budgets.js';
+import { expireVouchers } from '../db/store-vouchers.js';
+import { listSentButUnconfirmedRefunds } from '../db/store-refunds.js';
+import { updateRefundStatus } from '../db/store-refunds.js';
+import type { RefundService } from '../refund/service.js';
+import { runRetentionCleanup, type RetentionConfig } from '../db/retention.js';
 import * as log from '../logging/index.js';
 import * as metrics from '../metrics/index.js';
 
 export interface BackgroundWorkerDeps {
   db: Kysely<Database>;
   billingService?: BillingService;
+  refundService?: RefundService | null;
   config: Config;
 }
 
@@ -55,6 +61,56 @@ export class BackgroundWorkers {
       }
     });
 
+    // 4b. Sent-but-unconfirmed refund recovery - every 5 minutes
+    // Checks refunds that have a tx_hash but are still pending after 10 min.
+    // Re-verifies the on-chain receipt and updates the DB accordingly.
+    if (this.deps.refundService) {
+      const refundSvc = this.deps.refundService;
+      this.addWorker('unconfirmed-refund-recovery', 5 * 60_000, async () => {
+        const stuckRefunds = await listSentButUnconfirmedRefunds(db, 10, 20);
+        for (const refund of stuckRefunds) {
+          if (!refund.refund_tx_hash) continue;
+          try {
+            const receipt = await refundSvc.checkReceipt(refund.refund_tx_hash);
+            if (receipt.confirmed) {
+              await updateRefundStatus(
+                db,
+                Number(refund.id),
+                'success',
+                refund.refund_tx_hash,
+                '',
+                receipt.gasUsed ?? 0n,
+              );
+              log.info('Recovered unconfirmed refund as success', {
+                refundId: String(refund.id),
+                txHash: refund.refund_tx_hash,
+              });
+            } else if (receipt.failed) {
+              await updateRefundStatus(
+                db,
+                Number(refund.id),
+                'failed',
+                refund.refund_tx_hash,
+                'transaction reverted on-chain',
+                receipt.gasUsed ?? 0n,
+              );
+              log.warn('Recovered unconfirmed refund as failed', {
+                refundId: String(refund.id),
+                txHash: refund.refund_tx_hash,
+              });
+            }
+            // If neither confirmed nor failed, tx is still pending on-chain; skip
+          } catch (err) {
+            log.warn('Failed to check receipt for unconfirmed refund', {
+              refundId: String(refund.id),
+              txHash: refund.refund_tx_hash,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+      });
+    }
+
     // 5. Orphaned redemption recovery - every 5 minutes
     this.addWorker('orphaned-redemption-recovery', 5 * 60_000, async () => {
       // Roll back credits stuck in pending > 15 min
@@ -96,14 +152,37 @@ export class BackgroundWorkers {
       });
     }
 
-    // 7. Data retention - every 24 hours (initial run after 30s)
-    const retentionFn = async () => {
-      const result = await sql`
-        DELETE FROM lambda_invocations WHERE created_at < NOW() - INTERVAL '90 days'
-      `.execute(db);
-      const count = Number(result.numAffectedRows ?? 0);
-      if (count > 0) log.info('Data retention: deleted old invocations', { count });
+    // 7. Expired voucher cleanup - every 10 minutes
+    this.addWorker('voucher-expiry', 10 * 60_000, async () => {
+      const count = await expireVouchers(db);
+      if (count > 0) log.info('Expired pending vouchers', { count });
+    });
 
+    // 8. Data retention - every 24 hours (initial run after 30s)
+    const { config: cfg } = this.deps;
+    const retentionCfg: RetentionConfig = {
+      invocationRetentionDays: cfg.invocationRetentionDays,
+      nonceRetentionDays: cfg.nonceRetentionDays,
+      creditRetentionDays: cfg.creditRetentionDays,
+      voucherRetentionDays: cfg.voucherRetentionDays,
+      leaseAnonymizeDays: cfg.leaseAnonymizeDays,
+      batchSize: cfg.retentionBatchSize,
+    };
+    const retentionFn = async () => {
+      const result = await runRetentionCleanup(db, retentionCfg);
+      const total = result.invocationsDeleted + result.noncesDeleted +
+        result.creditsDeleted + result.vouchersDeleted + result.leasesAnonymized;
+      if (total > 0) {
+        log.info('Data retention cleanup completed', {
+          invocationsDeleted: result.invocationsDeleted,
+          noncesDeleted: result.noncesDeleted,
+          creditsDeleted: result.creditsDeleted,
+          vouchersDeleted: result.vouchersDeleted,
+          leasesAnonymized: result.leasesAnonymized,
+        });
+      }
+
+      // Also clean up old audit logs (not covered by retention engine)
       await sql`DELETE FROM admin_audit_log WHERE created_at < NOW() - INTERVAL '365 days'`.execute(db);
     };
     setTimeout(() => {
@@ -111,7 +190,7 @@ export class BackgroundWorkers {
     }, 30_000);
     this.addWorker('data-retention', 24 * 60 * 60_000, retentionFn);
 
-    // 8. Analytics refresh - every 5 minutes
+    // 9. Analytics refresh - every 5 minutes
     this.addWorker('analytics-refresh', 5 * 60_000, async () => {
       try {
         await sql`REFRESH MATERIALIZED VIEW CONCURRENTLY function_analytics_mv`.execute(db);

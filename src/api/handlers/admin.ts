@@ -47,6 +47,10 @@ import type {
   InsertableAuditLogEntry,
 } from '../../db/store-admin.js';
 
+import { deleteAllDataForAddress } from '../../db/store-gdpr.js';
+import { getTableSizes, runRetentionCleanup, type RetentionConfig } from '../../db/retention.js';
+import { isValidEthAddress } from '../../validation/index.js';
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -1622,24 +1626,26 @@ export function createAdminHandlers(deps: AdminDeps) {
     try {
       if (asset === 'usdc') {
         const result = await svc.sendRefund(treasuryAddress, amount);
+        const success = result.status === 'success';
         return c.json({
-          success: true,
+          success,
           from: svc.getFromAddress(),
           to: treasuryAddress,
           asset: 'usdc',
           amount: req.amount,
           result,
-        });
+        }, success ? 200 : 502);
       } else {
         const result = await svc.sendETH(treasuryAddress, amount);
+        const success = result.status === 'success';
         return c.json({
-          success: true,
+          success,
           from: svc.getFromAddress(),
           to: treasuryAddress,
           asset: 'eth',
           amount: req.amount,
           result,
-        });
+        }, success ? 200 : 502);
       }
     } catch (err) {
       log.error(`wallet ${asset} sweep failed`, {
@@ -1716,6 +1722,88 @@ export function createAdminHandlers(deps: AdminDeps) {
   }
 
   // =========================================================================
+  // GDPR & Data Retention
+  // =========================================================================
+
+  async function handleAdminGDPRDelete(c: Context): Promise<Response> {
+    if (!db) return c.json({ error: 'database not configured' }, 503);
+
+    const body = await c.req.json<{ address?: string }>().catch(() => ({} as { address?: string }));
+    const address = body.address?.trim().toLowerCase();
+    if (!address || !isValidEthAddress(address)) {
+      return c.json({ error: 'valid Ethereum address is required' }, 400);
+    }
+
+    try {
+      const result = await deleteAllDataForAddress(db, address);
+
+      await createAuditEntry(db, {
+        admin_ip: c.req.header('X-Forwarded-For') ?? c.req.header('X-Real-IP') ?? 'unknown',
+        action: 'gdpr.delete_all_data',
+        target_type: 'address',
+        target_id: address,
+        details: result,
+      });
+
+      log.info('GDPR deletion completed', { address, ...result });
+      return c.json({ success: true, address, ...result });
+    } catch (err) {
+      log.error('GDPR deletion failed', {
+        address,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'GDPR deletion failed' }, 500);
+    }
+  }
+
+  async function handleAdminTableSizes(c: Context): Promise<Response> {
+    if (!db) return c.json({ error: 'database not configured' }, 503);
+
+    try {
+      const sizes = await getTableSizes(db);
+      return c.json({ tables: sizes });
+    } catch (err) {
+      log.error('failed to get table sizes', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'failed to get table sizes' }, 500);
+    }
+  }
+
+  async function handleAdminRunRetention(c: Context): Promise<Response> {
+    if (!db) return c.json({ error: 'database not configured' }, 503);
+
+    const retentionCfg: RetentionConfig = {
+      invocationRetentionDays: config.invocationRetentionDays,
+      nonceRetentionDays: config.nonceRetentionDays,
+      creditRetentionDays: config.creditRetentionDays,
+      voucherRetentionDays: config.voucherRetentionDays,
+      leaseAnonymizeDays: config.leaseAnonymizeDays,
+      batchSize: config.retentionBatchSize,
+    };
+
+    try {
+      const result = await runRetentionCleanup(db, retentionCfg);
+
+      await createAuditEntry(db, {
+        admin_ip: c.req.header('X-Forwarded-For') ?? c.req.header('X-Real-IP') ?? 'unknown',
+        action: 'retention.manual_run',
+        target_type: 'system',
+        target_id: 'retention',
+        details: result,
+      });
+
+      log.info('Manual retention cleanup completed', { ...result });
+      return c.json({ success: true, ...result });
+    } catch (err) {
+      log.error('retention cleanup failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return c.json({ error: 'retention cleanup failed' }, 500);
+    }
+  }
+
+  // =========================================================================
   // Return all admin handlers
   // =========================================================================
 
@@ -1766,5 +1854,10 @@ export function createAdminHandlers(deps: AdminDeps) {
     // Reconciliation
     handleAdminRunReconciliation,
     handleAdminGetReconciliation,
+
+    // GDPR & Data Retention
+    handleAdminGDPRDelete,
+    handleAdminTableSizes,
+    handleAdminRunRetention,
   };
 }

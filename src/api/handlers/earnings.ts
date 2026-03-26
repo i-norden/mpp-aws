@@ -71,7 +71,7 @@ async function verifyOwnership(
       error: 'authentication required',
       message: 'X-Signature and X-Message headers are required to access earnings information',
       hint: "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet",
-    }, 401) as unknown as Response;
+    }, 401);
     return false;
   }
 
@@ -80,7 +80,7 @@ async function verifyOwnership(
     c.res = jsonWithStatus(c, {
       error: 'authentication failed',
       message: result.errorMessage,
-    }, result.statusCode ?? 401) as unknown as Response;
+    }, result.statusCode ?? 401);
     return false;
   }
 
