@@ -19,15 +19,14 @@ import type { BillingService } from '../../billing/service.js';
 import type { OFACChecker } from '../../ofac/checker.js';
 import { verifyAddressOwnershipWithReplay } from '../../auth/signature.js';
 import { validateEthAddress } from '../../validation/index.js';
-import { getCreditBalance } from '../../db/store-credits.js';
-import { createCredit } from '../../db/store-credits.js';
+import { getCreditBalance, listCredits, createCredit } from '../../db/store-credits.js';
 import {
   getVoucherRedemption,
   tryCreateVoucherRedemption,
   updateVoucherRedemptionStatus,
 } from '../../db/store-vouchers.js';
 import * as log from '../../logging/index.js';
-import { jsonWithStatus } from '../response.js';
+import { errorResponse, ErrorCodes } from '../errors.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -68,20 +67,13 @@ async function verifyOwnership(
   const message = c.req.header('X-Message') ?? '';
 
   if (!signature || !message) {
-    c.res = c.json({
-      error: 'authentication required',
-      message: 'X-Signature and X-Message headers are required to access credit information',
-      hint: "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet",
-    }, 401);
+    c.res = errorResponse(c, 401, ErrorCodes.AUTHENTICATION_REQUIRED, 'X-Signature and X-Message headers are required to access credit information', "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet");
     return false;
   }
 
   const result = await verifyAddressOwnershipWithReplay(db, signature, message, address);
   if (!result.valid) {
-    c.res = jsonWithStatus(c, {
-      error: 'authentication failed',
-      message: result.errorMessage,
-    }, result.statusCode ?? 401);
+    c.res = errorResponse(c, result.statusCode ?? 401, ErrorCodes.AUTHENTICATION_FAILED, result.errorMessage ?? 'authentication failed');
     return false;
   }
 
@@ -101,17 +93,17 @@ export function createCreditsHandlers(deps: CreditsDeps) {
 
   async function handleGetCredits(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const rawAddress = c.req.param('address') ?? '';
     if (!rawAddress) {
-      return c.json({ error: 'address is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'address is required');
     }
     try {
       validateEthAddress(rawAddress, 'address');
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : String(err));
     }
 
     const address = rawAddress.toLowerCase();
@@ -136,7 +128,7 @@ export function createCreditsHandlers(deps: CreditsDeps) {
         payer: address,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to get credit balance' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get credit balance');
     }
   }
 
@@ -146,17 +138,17 @@ export function createCreditsHandlers(deps: CreditsDeps) {
 
   async function handleListCredits(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const rawAddress = c.req.param('address') ?? '';
     if (!rawAddress) {
-      return c.json({ error: 'address is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'address is required');
     }
     try {
       validateEthAddress(rawAddress, 'address');
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : String(err));
     }
 
     const address = rawAddress.toLowerCase();
@@ -166,20 +158,17 @@ export function createCreditsHandlers(deps: CreditsDeps) {
     }
 
     const includeRedeemed = c.req.query('include_redeemed') === 'true';
+    const cursorParam = c.req.query('cursor');
+    const cursor = cursorParam ? new Date(cursorParam) : undefined;
+    const limitParam = c.req.query('limit');
+    const limit = limitParam ? Math.min(Math.max(1, parseInt(limitParam, 10) || 100), 500) : 100;
 
     try {
-      let query = db
-        .selectFrom('credits')
-        .selectAll()
-        .where('payer_address', '=', address)
-        .orderBy('created_at', 'desc')
-        .limit(100);
-
-      if (!includeRedeemed) {
-        query = query.where('withdrawal_status', '=', 'available');
-      }
-
-      const credits = await query.execute();
+      const credits = await listCredits(db, address, {
+        limit,
+        cursor,
+        includeRedeemed,
+      });
 
       interface CreditEntry {
         id: number;
@@ -220,7 +209,7 @@ export function createCreditsHandlers(deps: CreditsDeps) {
         payer: address,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list credits' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list credits');
     }
   }
 
@@ -230,31 +219,28 @@ export function createCreditsHandlers(deps: CreditsDeps) {
 
   async function handleRedeemCredits(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     if (!config.refundEnabled) {
-      return c.json({ error: 'refunds not enabled' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'refunds not enabled');
     }
 
     const rawAddress = c.req.param('address') ?? '';
     if (!rawAddress) {
-      return c.json({ error: 'address is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'address is required');
     }
     try {
       validateEthAddress(rawAddress, 'address');
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : String(err));
     }
 
     const address = rawAddress.toLowerCase();
 
     // OFAC check on credit redemption address
     if (ofacChecker && ofacChecker.isBlocked(address)) {
-      return c.json({
-        error: 'address_blocked',
-        message: 'This address is not permitted to use this service',
-      }, 403);
+      return errorResponse(c, 403, ErrorCodes.ADDRESS_BLOCKED, 'This address is not permitted to use this service');
     }
 
     if (!(await verifyOwnership(c, db, address))) {
@@ -270,36 +256,30 @@ export function createCreditsHandlers(deps: CreditsDeps) {
         payer: address,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to get credit balance' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get credit balance');
     }
 
     if (balance.availableBalance <= 0n) {
-      return c.json({
-        error: 'no credits available',
-        availableBalance: 0n,
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INSUFFICIENT_BALANCE, 'no credits available');
     }
 
     // Check minimum threshold
     if (balance.availableBalance < config.minRefundThreshold) {
-      return c.json({
-        error: 'credit balance below minimum redemption threshold',
+      return errorResponse(c, 400, ErrorCodes.INSUFFICIENT_BALANCE, 'credit balance below minimum redemption threshold', {
         availableBalance: balance.availableBalance,
         availableUSD: formatUSD(balance.availableBalance),
         minimumRequired: config.minRefundThreshold,
         minimumUSD: formatUSD(config.minRefundThreshold),
-      }, 400);
+      });
     }
 
     // Check if billing service is available for redemption
     if (!billingService || !billingService.isRefundEnabled()) {
-      return c.json({
-        error: 'credit_redemption_unavailable',
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'Credit redemption service is not configured. Please contact support for manual redemption or wait for service availability.', {
         availableBalance: balance.availableBalance,
         availableUSD: formatUSD(balance.availableBalance),
-        message: 'Credit redemption service is not configured. Please contact support for manual redemption or wait for service availability.',
         configHint: 'Set REFUND_ENABLED=true and configure REFUND_PRIVATE_KEY and RPC_URL to enable automatic redemption.',
-      }, 503);
+      });
     }
 
     // Process the redemption via billing service
@@ -311,19 +291,14 @@ export function createCreditsHandlers(deps: CreditsDeps) {
         payer: address,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({
-        error: 'redemption_failed',
-        message: 'Failed to process credit redemption',
-      }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'Failed to process credit redemption');
     }
 
     if (!result.success) {
-      return c.json({
-        error: 'redemption_failed',
-        message: result.error,
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, result.error ?? 'redemption failed', {
         availableBalance: result.availableBalance ?? 0n,
         availableUSD: formatUSD(result.availableBalance ?? 0n),
-      }, 400);
+      });
     }
 
     return c.json({
@@ -345,14 +320,14 @@ export function createCreditsHandlers(deps: CreditsDeps) {
 
   async function handleRedeemVoucher(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const address = (c.req.param('address') ?? '').toLowerCase();
     try {
       validateEthAddress(address, 'address');
     } catch {
-      return c.json({ error: 'invalid address format' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'invalid address format');
     }
 
     if (!(await verifyOwnership(c, db, address))) {
@@ -361,7 +336,7 @@ export function createCreditsHandlers(deps: CreditsDeps) {
 
     // OFAC compliance check
     if (ofacChecker && ofacChecker.isBlocked(address)) {
-      return c.json({ error: 'address is blocked by compliance policy' }, 403);
+      return errorResponse(c, 403, ErrorCodes.ADDRESS_BLOCKED, 'address is blocked by compliance policy');
     }
 
     const body = await c.req.json<{
@@ -370,17 +345,17 @@ export function createCreditsHandlers(deps: CreditsDeps) {
 
     const voucherId = body.voucher_id?.trim();
     if (!voucherId) {
-      return c.json({ error: 'voucher_id is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'voucher_id is required');
     }
 
     // Check if voucher was already redeemed
     const existing = await getVoucherRedemption(db, voucherId);
     if (existing) {
       if (existing.status === 'success') {
-        return c.json({ error: 'voucher already redeemed' }, 409);
+        return errorResponse(c, 409, ErrorCodes.CONFLICT, 'voucher already redeemed');
       }
       if (existing.status === 'pending') {
-        return c.json({ error: 'voucher redemption already in progress' }, 409);
+        return errorResponse(c, 409, ErrorCodes.CONFLICT, 'voucher redemption already in progress');
       }
     }
 
@@ -396,19 +371,19 @@ export function createCreditsHandlers(deps: CreditsDeps) {
     });
 
     if (!created) {
-      return c.json({ error: 'voucher already redeemed' }, 409);
+      return errorResponse(c, 409, ErrorCodes.CONFLICT, 'voucher already redeemed');
     }
 
     // Retrieve the redemption to get the full record
     const redemption = await getVoucherRedemption(db, voucherId);
     if (!redemption) {
-      return c.json({ error: 'failed to process voucher' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to process voucher');
     }
 
     // Check expiry
     if (new Date(redemption.expires_at) < new Date()) {
       await updateVoucherRedemptionStatus(db, voucherId, 'failed');
-      return c.json({ error: 'voucher has expired' }, 410);
+      return errorResponse(c, 410, ErrorCodes.INVALID_REQUEST, 'voucher has expired');
     }
 
     // Create a credit for the voucher amount
@@ -428,7 +403,7 @@ export function createCreditsHandlers(deps: CreditsDeps) {
         error: err instanceof Error ? err.message : String(err),
       });
       await updateVoucherRedemptionStatus(db, voucherId, 'failed');
-      return c.json({ error: 'failed to process voucher redemption' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to process voucher redemption');
     }
 
     return c.json({

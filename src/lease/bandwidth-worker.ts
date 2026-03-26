@@ -204,7 +204,7 @@ export class BandwidthWorker {
           ]),
         )
         .execute();
-      leases = rows as unknown as LeaseRow[];
+      leases = rows;
     } catch (err) {
       log.error('failed to list leases for bandwidth check', {
         error: err instanceof Error ? err.message : String(err),

@@ -17,10 +17,9 @@ import {
   ResourceLimitReachedError,
   UserLimitReachedError,
 } from '../../db/store-lease.js';
-import { HttpError } from '../errors.js';
+import { HttpError, errorResponse, ErrorCodes } from '../errors.js';
 import { getPaymentInfo } from '../middleware/mpp.js';
 import { readJsonBody } from '../request-body.js';
-import { jsonWithStatus } from '../response.js';
 import * as log from '../../logging/index.js';
 
 type LeaseResource = Selectable<LeaseResourceTable>;
@@ -207,11 +206,7 @@ async function requireAddressOwnership(
   const message = c.req.header('X-Wallet-Message') ?? c.req.header('X-Message') ?? '';
 
   if (!address || !signature || !message) {
-    c.res = c.json({
-      error: 'authentication required',
-      message: 'X-Wallet-Address, X-Wallet-Signature, and X-Wallet-Message headers are required',
-      hint: "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet",
-    }, 401);
+    c.res = errorResponse(c, 401, ErrorCodes.AUTHENTICATION_REQUIRED, 'X-Wallet-Address, X-Wallet-Signature, and X-Wallet-Message headers are required', "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet");
     return null;
   }
 
@@ -222,10 +217,7 @@ async function requireAddressOwnership(
     address,
   );
   if (!result.valid) {
-    c.res = jsonWithStatus(c, {
-      error: 'authentication failed',
-      message: result.errorMessage,
-    }, result.statusCode ?? 401);
+    c.res = errorResponse(c, result.statusCode ?? 401, ErrorCodes.AUTHENTICATION_FAILED, result.errorMessage ?? 'authentication failed');
     return null;
   }
 
@@ -289,7 +281,7 @@ export function createLeaseHandlers(deps: LeaseDeps) {
       log.error('failed to list lease resources', {
         error: error instanceof Error ? error.message : String(error),
       });
-      return c.json({ error: 'failed to list resources' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list resources');
     }
 
     const items: ResourceResponse[] = resources.map((resource) => ({
@@ -354,28 +346,22 @@ export function createLeaseHandlers(deps: LeaseDeps) {
       quoted = await quoteLeaseRequest(c);
     } catch (error) {
       if (error instanceof HttpError) {
-        return jsonWithStatus(c, { error: error.message, details: error.details }, error.status);
+        return errorResponse(c, error.status, ErrorCodes.INTERNAL_ERROR, error.message, error.details);
       }
       throw error;
     }
 
     if (!body.publicKey) {
-      return c.json({
-        error: 'missing_public_key',
-        message: 'publicKey is required (base64-encoded X25519 public key)',
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'publicKey is required (base64-encoded X25519 public key)');
     }
 
     const paymentInfo = getPaymentInfo(c);
     if (!paymentInfo) {
-      return c.json({ error: 'payment info missing' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'payment info missing');
     }
 
     if (paymentInfo.amount !== quoted.quote.totalAtomic) {
-      return c.json({
-        error: 'payment amount mismatch',
-        message: 'Lease payment amount no longer matches the exact quoted price.',
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'Lease payment amount no longer matches the exact quoted price.');
     }
 
     try {
@@ -408,7 +394,7 @@ export function createLeaseHandlers(deps: LeaseDeps) {
       });
     } catch (error) {
       const httpError = leaseErrorToHttpError(error);
-      return jsonWithStatus(c, { error: httpError.message, details: httpError.details }, httpError.status);
+      return errorResponse(c, httpError.status, ErrorCodes.INTERNAL_ERROR, httpError.message, httpError.details);
     }
   }
 
@@ -416,7 +402,7 @@ export function createLeaseHandlers(deps: LeaseDeps) {
     const resourceId = c.req.param('resourceId') ?? '';
     const leaseId = c.req.param('leaseId') ?? '';
     if (!resourceId || !leaseId) {
-      return c.json({ error: 'resource ID and lease ID are required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'resource ID and lease ID are required');
     }
 
     const payerAddress = await requireAddressOwnership(c, db);
@@ -431,7 +417,7 @@ export function createLeaseHandlers(deps: LeaseDeps) {
         payerAddress,
       );
       if (!status) {
-        return c.json({ error: 'lease_not_found', message: 'Lease not found' }, 404);
+        return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'Lease not found');
       }
 
       return c.json(status);
@@ -440,7 +426,7 @@ export function createLeaseHandlers(deps: LeaseDeps) {
         leaseId,
         error: error instanceof Error ? error.message : String(error),
       });
-      return c.json({ error: 'failed to get lease status' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get lease status');
     }
   }
 
@@ -461,21 +447,18 @@ export function createLeaseHandlers(deps: LeaseDeps) {
       quoted = await quoteRenewalRequest(c);
     } catch (error) {
       if (error instanceof HttpError) {
-        return jsonWithStatus(c, { error: error.message, details: error.details }, error.status);
+        return errorResponse(c, error.status, ErrorCodes.INTERNAL_ERROR, error.message, error.details);
       }
       throw error;
     }
 
     const paymentInfo = getPaymentInfo(c);
     if (!paymentInfo) {
-      return c.json({ error: 'payment info missing' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'payment info missing');
     }
 
     if (paymentInfo.amount !== quoted.quote.totalAtomic) {
-      return c.json({
-        error: 'payment amount mismatch',
-        message: 'Lease renewal payment amount no longer matches the exact quoted price.',
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'Lease renewal payment amount no longer matches the exact quoted price.');
     }
 
     try {
@@ -489,7 +472,7 @@ export function createLeaseHandlers(deps: LeaseDeps) {
       });
     } catch (error) {
       const httpError = leaseErrorToHttpError(error);
-      return jsonWithStatus(c, { error: httpError.message, details: httpError.details }, httpError.status);
+      return errorResponse(c, httpError.status, ErrorCodes.INTERNAL_ERROR, httpError.message, httpError.details);
     }
 
     const status = await getLeaseService().getLeaseStatus(

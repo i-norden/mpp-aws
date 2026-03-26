@@ -20,6 +20,7 @@ import {
   resolvePublicHostname,
 } from '../../net/pinned-https.js';
 import * as log from '../../logging/index.js';
+import { errorResponse, ErrorCodes } from '../errors.js';
 import type { OFACChecker } from '../../ofac/checker.js';
 import type { Selectable, Insertable } from 'kysely';
 
@@ -282,9 +283,10 @@ function dbFunctionToSpec(fn: LambdaFunction, pricingEngine: PricingEngine): Fun
   if (fn.output_schema) spec.outputSchema = fn.output_schema;
   if (fn.examples) {
     try {
-      const examples = typeof fn.examples === 'string'
-        ? JSON.parse(fn.examples as string) as FunctionExample[]
-        : fn.examples as unknown as FunctionExample[];
+      const raw = typeof fn.examples === 'string'
+        ? JSON.parse(fn.examples)
+        : fn.examples;
+      const examples = Array.isArray(raw) ? raw as FunctionExample[] : [];
       if (Array.isArray(examples) && examples.length > 0) {
         spec.examples = examples;
       }
@@ -325,7 +327,7 @@ export function createRegisterHandlers(deps: RegisterDeps) {
 
   async function handlePublicRegister(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     // Parse request body
@@ -334,19 +336,16 @@ export function createRegisterHandlers(deps: RegisterDeps) {
       req = await c.req.json() as PublicRegisterRequest;
     } catch {
       log.warn('invalid public register request body');
-      return c.json({ error: 'invalid request body' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'invalid request body');
     }
 
     // Validate required fields
     if (!req.endpoint) {
-      return c.json({ error: 'invalid request body' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'invalid request body');
     }
 
     if (!req.description || !req.description.trim()) {
-      return c.json({
-        error: 'missing required field',
-        message: 'A non-empty description is required',
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'A non-empty description is required');
     }
 
     const hasInputSchema = req.inputSchema !== undefined && req.inputSchema !== null;
@@ -354,38 +353,26 @@ export function createRegisterHandlers(deps: RegisterDeps) {
     const hasOpenAPIURL = !!req.openApiSpecUrl;
 
     if (!hasInputSchema && !hasDocURL && !hasOpenAPIURL) {
-      return c.json({
-        error: 'insufficient documentation',
-        message: 'At least one of inputSchema, documentationUrl, or openApiSpecUrl must be provided',
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'At least one of inputSchema, documentationUrl, or openApiSpecUrl must be provided');
     }
 
     // Validate endpoint URL with SSRF protection
     const endpointValidation = await validateEndpointURL(req.endpoint, config.maxURLLength);
     if (!endpointValidation.valid) {
-      return c.json({
-        error: 'invalid endpoint URL',
-        message: endpointValidation.error,
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, endpointValidation.error ?? 'invalid endpoint URL');
     }
 
     // Validate pricing model
     let pricingModel = 'fixed';
     if (req.pricingModel) {
       if (req.pricingModel !== 'fixed' && req.pricingModel !== 'metered') {
-        return c.json({
-          error: 'invalid pricing model',
-          message: "pricingModel must be 'fixed' or 'metered'",
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, "pricingModel must be 'fixed' or 'metered'");
       }
       pricingModel = req.pricingModel;
     }
 
     if (pricingModel === 'metered' && req.customCostPerRequest === undefined) {
-      return c.json({
-        error: 'metered pricing requires customCostPerRequest',
-        message: 'customCostPerRequest is required for metered pricing (serves as the price ceiling)',
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'customCostPerRequest is required for metered pricing (serves as the price ceiling)');
     }
 
     // Validate payToAddress if provided
@@ -393,16 +380,10 @@ export function createRegisterHandlers(deps: RegisterDeps) {
       try {
         validateEthAddress(req.payToAddress, 'payToAddress');
       } catch (err) {
-        return c.json({
-          error: 'invalid payToAddress',
-          message: err instanceof Error ? err.message : String(err),
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : String(err));
       }
       if (ofacChecker && ofacChecker.isBlocked(req.payToAddress)) {
-        return c.json({
-          error: 'address_blocked',
-          message: 'This address is not permitted to use this service',
-        }, 403);
+        return errorResponse(c, 403, ErrorCodes.FORBIDDEN, 'This address is not permitted to use this service');
       }
     }
 
@@ -424,11 +405,7 @@ export function createRegisterHandlers(deps: RegisterDeps) {
         paymentInfo &&
         existingOwner.toLowerCase() !== paymentInfo.payer.toLowerCase()
       ) {
-        return c.json({
-          error: 'endpoint owned by another address',
-          message: 'only the current owner can update a registered endpoint',
-          functionId: functionID,
-        }, 403);
+        return errorResponse(c, 403, ErrorCodes.FORBIDDEN, 'only the current owner can update a registered endpoint', { functionId: functionID });
       }
     }
 
@@ -437,10 +414,7 @@ export function createRegisterHandlers(deps: RegisterDeps) {
     if (!verification.reachable) {
       // If the endpoint returned 401/403 that's acceptable (requires auth)
       if (!verification.authRequired) {
-        return c.json({
-          error: 'endpoint unreachable',
-          message: 'Failed to reach endpoint within timeout',
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'Failed to reach endpoint within timeout');
       }
       log.info('endpoint returned auth-required during verification (expected with auth config)');
     }
@@ -448,44 +422,32 @@ export function createRegisterHandlers(deps: RegisterDeps) {
     // Get payment info
     const paymentInfo = getPaymentInfo(c);
     if (!paymentInfo) {
-      return c.json({ error: 'payment info missing' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'payment info missing');
     }
 
     // Validate visibility
     let visibility = 'public';
     if (req.visibility) {
       if (req.visibility !== 'public' && req.visibility !== 'private') {
-        return c.json({
-          error: 'invalid visibility',
-          message: "visibility must be 'public' or 'private'",
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, "visibility must be 'public' or 'private'");
       }
       visibility = req.visibility;
     }
 
     // Validate access list size
     if (req.allowedInvokers && req.allowedInvokers.length > config.maxAccessListSize) {
-      return c.json({
-        error: 'access list too large',
-        message: `maximum ${config.maxAccessListSize} addresses allowed in access list`,
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, `maximum ${config.maxAccessListSize} addresses allowed in access list`);
     }
 
     // Validate custom cost per request
     if (req.customCostPerRequest !== undefined) {
       const baseFee = pricingEngine.calculateInvocationCost(0, 0);
       if (BigInt(req.customCostPerRequest) < baseFee) {
-        return c.json({
-          error: 'custom cost too low',
-          message: `customCostPerRequest must be >= ${baseFee} (base fee)`,
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, `customCostPerRequest must be >= ${baseFee} (base fee)`);
       }
       const maxBaseFee = baseFee * 1000n;
       if (BigInt(req.customCostPerRequest) > maxBaseFee) {
-        return c.json({
-          error: 'custom cost too high',
-          message: `customCostPerRequest must be <= ${maxBaseFee} (1000x base fee)`,
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, `customCostPerRequest must be <= ${maxBaseFee} (1000x base fee)`);
       }
     }
 
@@ -539,7 +501,7 @@ export function createRegisterHandlers(deps: RegisterDeps) {
         payer: paymentInfo.payer,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to register endpoint' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to register endpoint');
     }
 
     // If private and allowedInvokers provided, insert into access list

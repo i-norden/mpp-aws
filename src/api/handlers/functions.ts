@@ -13,6 +13,7 @@ import type { Database, LambdaFunctionTable } from '../../db/types.js';
 import type { Config } from '../../config/index.js';
 import type { PricingEngine } from '../../pricing/engine.js';
 import * as log from '../../logging/index.js';
+import { errorResponse, ErrorCodes } from '../errors.js';
 import type { Selectable } from 'kysely';
 
 // ---------------------------------------------------------------------------
@@ -148,9 +149,10 @@ function dbFunctionToSpec(fn: LambdaFunction, pricingEngine: PricingEngine): Fun
   if (fn.output_schema) spec.outputSchema = fn.output_schema;
   if (fn.examples) {
     try {
-      const examples = typeof fn.examples === 'string'
-        ? JSON.parse(fn.examples as string) as FunctionExample[]
-        : fn.examples as unknown as FunctionExample[];
+      const raw = typeof fn.examples === 'string'
+        ? JSON.parse(fn.examples)
+        : fn.examples;
+      const examples = Array.isArray(raw) ? raw as FunctionExample[] : [];
       if (Array.isArray(examples) && examples.length > 0) {
         spec.examples = examples;
       }
@@ -215,7 +217,7 @@ export function createFunctionsHandlers(deps: FunctionsDeps) {
         log.error('failed to list functions from database', {
           error: err instanceof Error ? err.message : String(err),
         });
-        return c.json({ error: 'failed to list functions' }, 500);
+        return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list functions');
       }
     }
 
@@ -320,7 +322,7 @@ export function createFunctionsHandlers(deps: FunctionsDeps) {
   async function handleSearchFunctions(c: Context): Promise<Response> {
     const query = c.req.query('q') ?? '';
     if (!query) {
-      return c.json({ error: "query parameter 'q' is required" }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, "query parameter 'q' is required");
     }
 
     let limit = 20;
@@ -333,7 +335,7 @@ export function createFunctionsHandlers(deps: FunctionsDeps) {
     }
 
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     try {
@@ -363,7 +365,7 @@ export function createFunctionsHandlers(deps: FunctionsDeps) {
       log.error('failed to search functions', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'search failed' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'search failed');
     }
   }
 
@@ -374,16 +376,16 @@ export function createFunctionsHandlers(deps: FunctionsDeps) {
   async function handleGetFunctionAnalytics(c: Context): Promise<Response> {
     const rawName = c.req.param('name') ?? '';
     if (!rawName) {
-      return c.json({ error: 'function name is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'function name is required');
     }
 
     const functionName = normalizeFunctionName(rawName);
     if (!functionName) {
-      return c.json({ error: 'invalid function name' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'invalid function name');
     }
 
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     try {
@@ -407,10 +409,7 @@ export function createFunctionsHandlers(deps: FunctionsDeps) {
         .executeTakeFirst();
 
       if (!stats || stats.total_invocations === 0n) {
-        return c.json({
-          error: 'no analytics available',
-          message: 'This function has no recorded invocations yet',
-        }, 404);
+        return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'This function has no recorded invocations yet');
       }
 
       return c.json({
@@ -440,7 +439,7 @@ export function createFunctionsHandlers(deps: FunctionsDeps) {
       log.error('failed to get function analytics', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to retrieve analytics' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to retrieve analytics');
     }
   }
 

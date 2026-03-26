@@ -399,6 +399,7 @@ export function createApp(deps: ServerDeps): { app: Hono; workers: Workers; bill
     const backgroundWorkers = new BackgroundWorkers({
       db,
       billingService,
+      refundService: billingService.getRefundService(),
       config: cfg,
     });
     backgroundWorkers.start();

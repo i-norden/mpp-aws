@@ -25,9 +25,8 @@ import {
   revokeBudget,
 } from '../../db/store-budgets.js';
 import * as log from '../../logging/index.js';
-import { HttpError } from '../errors.js';
+import { HttpError, errorResponse, ErrorCodes } from '../errors.js';
 import { readJsonBody } from '../request-body.js';
-import { jsonWithStatus } from '../response.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,20 +74,13 @@ async function requireAddressOwnership(
   const message = c.req.header('X-Wallet-Message') ?? c.req.header('X-Message') ?? '';
 
   if (!address || !signature || !message) {
-    c.res = c.json({
-      error: 'authentication required',
-      message: 'X-Wallet-Address, X-Wallet-Signature, and X-Wallet-Message headers are required',
-      hint: "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet",
-    }, 401);
+    c.res = errorResponse(c, 401, ErrorCodes.AUTHENTICATION_REQUIRED, 'X-Wallet-Address, X-Wallet-Signature, and X-Wallet-Message headers are required', "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet");
     return null;
   }
 
   const result = await verifyAddressOwnershipWithReplay(db, signature, message, address);
   if (!result.valid) {
-    c.res = jsonWithStatus(c, {
-      error: 'authentication failed',
-      message: result.errorMessage,
-    }, result.statusCode ?? 401);
+    c.res = errorResponse(c, result.statusCode ?? 401, ErrorCodes.AUTHENTICATION_FAILED, result.errorMessage ?? 'authentication failed');
     return null;
   }
 
@@ -157,12 +149,12 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
     // 1. Require payment info
     const paymentInfo = getPaymentInfo(c);
     if (!paymentInfo) {
-      return c.json({ error: 'payment info missing' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'payment info missing');
     }
 
     // 2. Require database
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     // 3. Parse request body
@@ -171,7 +163,7 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
       req = (await readJsonBody<CreateBudgetRequest>(c, { allowEmpty: true })) ?? {};
     } catch (err) {
       if (err instanceof HttpError) {
-        return jsonWithStatus(c, { error: err.message, details: err.details }, err.status);
+        return errorResponse(c, err.status, ErrorCodes.INVALID_REQUEST, err.message, err.details);
       }
       throw err;
     }
@@ -180,7 +172,7 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
       requestedAmount = parseRequestedBudgetAmount(req);
     } catch (err) {
       if (err instanceof HttpError) {
-        return jsonWithStatus(c, { error: err.message }, err.status);
+        return errorResponse(c, err.status, ErrorCodes.INVALID_REQUEST, err.message);
       }
       throw err;
     }
@@ -197,10 +189,7 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
     const expiresAt = new Date(Date.now() + expiresInHours * 60 * 60 * 1000);
 
     if (paymentInfo.amount !== requestedAmount) {
-      return c.json({
-        error: 'payment amount mismatch',
-        message: 'Budget payment amount no longer matches amount_atomic_usdc.',
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'Budget payment amount no longer matches amount_atomic_usdc.');
     }
 
     // Parse max_per_invocation
@@ -209,20 +198,14 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
       try {
         const parsed = BigInt(req.max_per_invocation);
         if (parsed <= 0n) {
-          return c.json({
-            error: 'max_per_invocation must be greater than 0',
-          }, 400);
+          return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'max_per_invocation must be greater than 0');
         }
         if (parsed > requestedAmount) {
-          return c.json({
-            error: 'max_per_invocation must not exceed amount_atomic_usdc',
-          }, 400);
+          return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'max_per_invocation must not exceed amount_atomic_usdc');
         }
         maxPerInvocation = parsed;
       } catch {
-        return c.json({
-          error: 'max_per_invocation must be a whole-number atomic USDC value',
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'max_per_invocation must be a whole-number atomic USDC value');
       }
     }
 
@@ -251,7 +234,7 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
         payer: paymentInfo.payer,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to create budget' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to create budget');
     }
   }
 
@@ -262,11 +245,11 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
   async function handleGetBudget(c: Context): Promise<Response> {
     const budgetId = c.req.param('budgetId') ?? '';
     if (!budgetId) {
-      return c.json({ error: 'budget ID is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'budget ID is required');
     }
 
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     // Retrieve the budget
@@ -278,11 +261,11 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
         budgetId,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to retrieve budget' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to retrieve budget');
     }
 
     if (!budget) {
-      return c.json({ error: 'budget not found' }, 404);
+      return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'budget not found');
     }
 
     // Verify ownership
@@ -292,7 +275,7 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
     }
 
     if (verifiedAddr !== budget.payer_address) {
-      return c.json({ error: 'you do not own this budget' }, 403);
+      return errorResponse(c, 403, ErrorCodes.FORBIDDEN, 'you do not own this budget');
     }
 
     return c.json({
@@ -307,7 +290,7 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
 
   async function handleListBudgets(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const verifiedAddr = await requireAddressOwnership(c, db);
@@ -335,7 +318,7 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
         payer: verifiedAddr,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list budgets' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list budgets');
     }
   }
 
@@ -346,11 +329,11 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
   async function handleRevokeBudget(c: Context): Promise<Response> {
     const budgetId = c.req.param('budgetId') ?? '';
     if (!budgetId) {
-      return c.json({ error: 'budget ID is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'budget ID is required');
     }
 
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     // Verify ownership before revoking
@@ -368,15 +351,15 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
         budgetId,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to retrieve budget' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to retrieve budget');
     }
 
     if (!existingBudget) {
-      return c.json({ error: 'budget not found' }, 404);
+      return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'budget not found');
     }
 
     if (verifiedAddr !== existingBudget.payer_address) {
-      return c.json({ error: 'you do not own this budget' }, 403);
+      return errorResponse(c, 403, ErrorCodes.FORBIDDEN, 'you do not own this budget');
     }
 
     // Revoke the budget
@@ -388,11 +371,11 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
         budgetId,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to revoke budget' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to revoke budget');
     }
 
     if (!revokedBudget) {
-      return c.json({ error: 'budget not found or already revoked' }, 404);
+      return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'budget not found or already revoked');
     }
 
     return c.json({

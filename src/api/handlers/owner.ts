@@ -38,7 +38,7 @@ import {
   type EndpointAuth,
 } from '../../endpoint-auth/index.js';
 import * as log from '../../logging/index.js';
-import { jsonWithStatus } from '../response.js';
+import { errorResponse, ErrorCodes } from '../errors.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -121,20 +121,13 @@ async function verifyOwnership(
   const message = c.req.header('X-Message') ?? '';
 
   if (!signature || !message) {
-    c.res = c.json({
-      error: 'authentication required',
-      message: 'X-Signature and X-Message headers are required',
-      hint: "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet",
-    }, 401);
+    c.res = errorResponse(c, 401, ErrorCodes.AUTHENTICATION_REQUIRED, 'X-Signature and X-Message headers are required', "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet");
     return false;
   }
 
   const result = await verifyAddressOwnershipWithReplay(db, signature, message, address);
   if (!result.valid) {
-    c.res = jsonWithStatus(c, {
-      error: 'authentication failed',
-      message: result.errorMessage,
-    }, result.statusCode ?? 401);
+    c.res = errorResponse(c, result.statusCode ?? 401, ErrorCodes.AUTHENTICATION_FAILED, result.errorMessage ?? 'authentication failed');
     return false;
   }
 
@@ -153,7 +146,7 @@ async function verifyFunctionOwnership(
   const rawName = c.req.param('name') ?? '';
   const functionName = normalizeFunctionName(rawName);
   if (!functionName) {
-    c.res = c.json({ error: 'function name is required' }, 400);
+    c.res = errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'function name is required');
     return null;
   }
 
@@ -169,17 +162,17 @@ async function verifyFunctionOwnership(
       function: functionName,
       error: err instanceof Error ? err.message : String(err),
     });
-    c.res = c.json({ error: 'failed to look up function' }, 500);
+    c.res = errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to look up function');
     return null;
   }
 
   if (!fn) {
-    c.res = c.json({ error: 'function not found' }, 404);
+    c.res = errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'function not found');
     return null;
   }
 
   if (!fn.owner_address) {
-    c.res = c.json({ error: 'function has no owner' }, 403);
+    c.res = errorResponse(c, 403, ErrorCodes.FORBIDDEN, 'function has no owner');
     return null;
   }
 
@@ -258,7 +251,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
 
   async function handleOwnerGetFunction(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const fn = await verifyFunctionOwnership(c, db);
@@ -317,7 +310,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
 
   async function handleOwnerUpdateFunction(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const fn = await verifyFunctionOwnership(c, db);
@@ -329,7 +322,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
     try {
       req = await c.req.json() as OwnerUpdateRequest;
     } catch {
-      return c.json({ error: 'invalid request body' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'invalid request body');
     }
 
     // Build dynamic SET clause
@@ -338,7 +331,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
 
     if (req.description !== undefined) {
       if (!req.description.trim()) {
-        return c.json({ error: 'description cannot be empty' }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'description cannot be empty');
       }
       updates.description = req.description;
       changedFields.push('description');
@@ -386,10 +379,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
 
     if (req.pricingModel !== undefined) {
       if (req.pricingModel !== 'fixed' && req.pricingModel !== 'metered') {
-        return c.json({
-          error: 'invalid pricing model',
-          message: "pricingModel must be 'fixed' or 'metered'",
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, "pricingModel must be 'fixed' or 'metered'");
       }
       updates.pricing_model = req.pricingModel;
       changedFields.push('pricingModel');
@@ -399,17 +389,11 @@ export function createOwnerHandlers(deps: OwnerDeps) {
       const baseFee = pricingEngine.calculateInvocationCost(0, 0);
       const customCost = BigInt(req.customCostPerRequest);
       if (customCost < baseFee) {
-        return c.json({
-          error: 'custom cost too low',
-          message: `customCostPerRequest must be >= ${baseFee} (base fee)`,
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, `customCostPerRequest must be >= ${baseFee} (base fee)`);
       }
       const maxBaseFee = baseFee * 1000n;
       if (customCost > maxBaseFee) {
-        return c.json({
-          error: 'custom cost too high',
-          message: `customCostPerRequest must be <= ${maxBaseFee} (1000x base fee)`,
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, `customCostPerRequest must be <= ${maxBaseFee} (1000x base fee)`);
       }
       updates.custom_base_fee = customCost;
       changedFields.push('customCostPerRequest');
@@ -419,16 +403,10 @@ export function createOwnerHandlers(deps: OwnerDeps) {
       try {
         validateEthAddress(req.payToAddress, 'payToAddress');
       } catch (err) {
-        return c.json({
-          error: 'invalid payToAddress',
-          message: err instanceof Error ? err.message : String(err),
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : String(err));
       }
       if (ofacChecker && ofacChecker.isBlocked(req.payToAddress)) {
-        return c.json({
-          error: 'address_blocked',
-          message: 'This address is not permitted to use this service',
-        }, 403);
+        return errorResponse(c, 403, ErrorCodes.FORBIDDEN, 'This address is not permitted to use this service');
       }
       updates.pay_to_address = req.payToAddress.toLowerCase();
       changedFields.push('payToAddress');
@@ -436,10 +414,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
 
     if (req.visibility !== undefined) {
       if (req.visibility !== 'public' && req.visibility !== 'private') {
-        return c.json({
-          error: 'invalid visibility',
-          message: "visibility must be 'public' or 'private'",
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, "visibility must be 'public' or 'private'");
       }
       updates.visibility = req.visibility;
       changedFields.push('visibility');
@@ -452,18 +427,12 @@ export function createOwnerHandlers(deps: OwnerDeps) {
       changedFields.push('removeAuth');
     } else if (req.auth !== undefined) {
       if (!config.endpointAuthKey) {
-        return c.json({
-          error: 'endpoint auth encryption not configured',
-          message: 'ENDPOINT_AUTH_KEY must be set to update endpoint authentication',
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'ENDPOINT_AUTH_KEY must be set to update endpoint authentication');
       }
       try {
         validateEndpointAuth(req.auth);
       } catch (err) {
-        return c.json({
-          error: 'invalid auth configuration',
-          message: err instanceof Error ? err.message : String(err),
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : String(err));
       }
       try {
         const encrypted = encryptEndpointAuth(req.auth, config.endpointAuthKey);
@@ -474,12 +443,12 @@ export function createOwnerHandlers(deps: OwnerDeps) {
         log.error('failed to encrypt endpoint auth', {
           error: err instanceof Error ? err.message : String(err),
         });
-        return c.json({ error: 'failed to encrypt auth credentials' }, 500);
+        return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to encrypt auth credentials');
       }
     }
 
     if (changedFields.length === 0) {
-      return c.json({ error: 'no fields to update' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'no fields to update');
     }
 
     // Always update the timestamp
@@ -496,7 +465,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
         function: fn.function_name,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to update function' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to update function');
     }
 
     return c.json({
@@ -512,7 +481,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
 
   async function handleOwnerDisableFunction(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const fn = await verifyFunctionOwnership(c, db);
@@ -521,7 +490,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
     }
 
     if (!fn.enabled) {
-      return c.json({ error: 'function is already disabled' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'function is already disabled');
     }
 
     try {
@@ -535,7 +504,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
         function: fn.function_name,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to disable function' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to disable function');
     }
 
     return c.json({
@@ -550,7 +519,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
 
   async function handleOwnerEnableFunction(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const fn = await verifyFunctionOwnership(c, db);
@@ -559,7 +528,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
     }
 
     if (fn.enabled) {
-      return c.json({ error: 'function is already enabled' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'function is already enabled');
     }
 
     try {
@@ -573,7 +542,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
         function: fn.function_name,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to enable function' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to enable function');
     }
 
     return c.json({
@@ -588,7 +557,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
 
   async function handleOwnerTransferRequest(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const fn = await verifyFunctionOwnership(c, db);
@@ -600,35 +569,29 @@ export function createOwnerHandlers(deps: OwnerDeps) {
     try {
       req = await c.req.json() as TransferRequest;
     } catch {
-      return c.json({ error: 'newOwnerAddress is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'newOwnerAddress is required');
     }
 
     if (!req.newOwnerAddress) {
-      return c.json({ error: 'newOwnerAddress is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'newOwnerAddress is required');
     }
 
     try {
       validateEthAddress(req.newOwnerAddress, 'newOwnerAddress');
     } catch (err) {
-      return c.json({
-        error: 'invalid newOwnerAddress',
-        message: err instanceof Error ? err.message : String(err),
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : String(err));
     }
 
     const newOwner = req.newOwnerAddress.toLowerCase();
 
     // Cannot transfer to self
     if (newOwner === fn.owner_address!.toLowerCase()) {
-      return c.json({ error: 'cannot transfer to yourself' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'cannot transfer to yourself');
     }
 
     // OFAC check on new owner
     if (ofacChecker && ofacChecker.isBlocked(newOwner)) {
-      return c.json({
-        error: 'address_blocked',
-        message: 'This address is not permitted to use this service',
-      }, 403);
+      return errorResponse(c, 403, ErrorCodes.FORBIDDEN, 'This address is not permitted to use this service');
     }
 
     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
@@ -659,7 +622,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
         function: fn.function_name,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to create transfer request' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to create transfer request');
     }
 
     return c.json({
@@ -676,13 +639,13 @@ export function createOwnerHandlers(deps: OwnerDeps) {
 
   async function handleOwnerTransferAccept(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const rawName = c.req.param('name') ?? '';
     const functionName = normalizeFunctionName(rawName);
     if (!functionName) {
-      return c.json({ error: 'function name is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'function name is required');
     }
 
     // Look up pending transfer
@@ -700,16 +663,16 @@ export function createOwnerHandlers(deps: OwnerDeps) {
         function: functionName,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to look up transfer request' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to look up transfer request');
     }
 
     if (!transfer) {
-      return c.json({ error: 'no pending transfer request found' }, 404);
+      return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'no pending transfer request found');
     }
 
     // Check expiry
     if (new Date() > new Date(transfer.expires_at)) {
-      return c.json({ error: 'transfer request has expired' }, 410);
+      return errorResponse(c, 410, ErrorCodes.INVALID_REQUEST, 'transfer request has expired');
     }
 
     // Verify caller is the new owner
@@ -719,10 +682,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
 
     // OFAC re-check on new owner
     if (ofacChecker && ofacChecker.isBlocked(transfer.new_owner)) {
-      return c.json({
-        error: 'address_blocked',
-        message: 'This address is not permitted to use this service',
-      }, 403);
+      return errorResponse(c, 403, ErrorCodes.FORBIDDEN, 'This address is not permitted to use this service');
     }
 
     // Execute the transfer atomically
@@ -746,7 +706,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
         function: functionName,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to execute transfer' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to execute transfer');
     }
 
     return c.json({
@@ -763,7 +723,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
 
   async function handleOwnerCancelTransfer(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const fn = await verifyFunctionOwnership(c, db);
@@ -783,7 +743,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
         function: fn.function_name,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to cancel transfer request' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to cancel transfer request');
     }
 
     return c.json({
@@ -798,13 +758,13 @@ export function createOwnerHandlers(deps: OwnerDeps) {
 
   async function handleManageAccess(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const rawName = c.req.param('name') ?? '';
     const functionName = normalizeFunctionName(rawName);
     if (!functionName) {
-      return c.json({ error: 'function name is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'function name is required');
     }
 
     // Get the function to verify ownership
@@ -816,15 +776,15 @@ export function createOwnerHandlers(deps: OwnerDeps) {
         .where('function_name', '=', functionName)
         .executeTakeFirst();
     } catch {
-      return c.json({ error: 'function not found' }, 404);
+      return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'function not found');
     }
 
     if (!fn) {
-      return c.json({ error: 'function not found' }, 404);
+      return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'function not found');
     }
 
     if (!fn.owner_address) {
-      return c.json({ error: 'function has no owner' }, 403);
+      return errorResponse(c, 403, ErrorCodes.FORBIDDEN, 'function has no owner');
     }
 
     // Verify caller is owner
@@ -836,7 +796,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
     try {
       req = await c.req.json() as ManageAccessRequest;
     } catch {
-      return c.json({ error: 'invalid request body' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'invalid request body');
     }
 
     // Process grants atomically (count check + insert in a single transaction)
@@ -856,16 +816,13 @@ export function createOwnerHandlers(deps: OwnerDeps) {
           await addToAccessList(db, functionName, entries, config.maxAccessListSize);
         } catch (err) {
           if (err instanceof AccessListFullError) {
-            return c.json({
-              error: 'access list too large',
-              message: `maximum ${config.maxAccessListSize} addresses allowed (currently ${err.currentCount})`,
-            }, 400);
+            return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, `maximum ${config.maxAccessListSize} addresses allowed (currently ${err.currentCount})`);
           }
           log.error('failed to grant access batch', {
             function: functionName,
             error: err instanceof Error ? err.message : String(err),
           });
-          return c.json({ error: 'failed to grant access' }, 500);
+          return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to grant access');
         }
       }
     }
@@ -906,7 +863,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
         function: functionName,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list access list' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list access list');
     }
   }
 
@@ -916,13 +873,13 @@ export function createOwnerHandlers(deps: OwnerDeps) {
 
   async function handleGetAccess(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const rawName = c.req.param('name') ?? '';
     const functionName = normalizeFunctionName(rawName);
     if (!functionName) {
-      return c.json({ error: 'function name is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'function name is required');
     }
 
     // Get the function to verify ownership
@@ -934,15 +891,15 @@ export function createOwnerHandlers(deps: OwnerDeps) {
         .where('function_name', '=', functionName)
         .executeTakeFirst();
     } catch {
-      return c.json({ error: 'function not found' }, 404);
+      return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'function not found');
     }
 
     if (!fn) {
-      return c.json({ error: 'function not found' }, 404);
+      return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'function not found');
     }
 
     if (!fn.owner_address) {
-      return c.json({ error: 'function has no owner' }, 403);
+      return errorResponse(c, 403, ErrorCodes.FORBIDDEN, 'function has no owner');
     }
 
     // Verify caller is owner
@@ -969,7 +926,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
         function: functionName,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list access list' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list access list');
     }
   }
 

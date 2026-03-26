@@ -6,8 +6,8 @@
  * provisioning status until instances are running or failed.
  */
 
-import type { Kysely } from 'kysely';
-import type { Database } from '../db/types.js';
+import type { Kysely, Selectable } from 'kysely';
+import type { Database, LeaseTable } from '../db/types.js';
 import * as log from '../logging/index.js';
 import * as metrics from '../metrics/index.js';
 
@@ -54,32 +54,8 @@ export interface EC2Manager {
 // Lease row type (selected from the leases table)
 // ---------------------------------------------------------------------------
 
-export interface LeaseRow {
-  id: string;
-  resource_id: string;
-  payer_address: string;
-  amount_paid: bigint;
-  payment_tx_hash: string;
-  duration_days: number;
-  instance_id: string | null;
-  public_ip: string | null;
-  ssh_public_key: string;
-  status: string;
-  provision_attempts: number;
-  created_at: Date;
-  expires_at: Date;
-  storage_gb: number | null;
-  has_public_ip: boolean;
-  has_load_balancer: boolean;
-  egress_limit_gb: number | null;
-  ingress_limit_gb: number | null;
-  egress_used_gb: number;
-  ingress_used_gb: number;
-  security_group_id: string | null;
-  error_message: string | null;
-  provisioned_at: Date | null;
-  price_breakdown: unknown;
-}
+/** Lease row as returned by Kysely selectAll() / returningAll(). */
+export type LeaseRow = Selectable<LeaseTable>;
 
 // ---------------------------------------------------------------------------
 // Worker config
@@ -198,7 +174,7 @@ export class ProvisioningWorker {
         )
         .returningAll()
         .execute();
-      leases = rows as unknown as LeaseRow[];
+      leases = rows;
     } catch (err) {
       log.error('failed to claim pending leases', {
         error: err instanceof Error ? err.message : String(err),
@@ -403,7 +379,7 @@ export class ProvisioningWorker {
         .selectAll()
         .where('status', '=', 'provisioning')
         .execute();
-      leases = rows as unknown as LeaseRow[];
+      leases = rows;
     } catch (err) {
       log.error('failed to list provisioning leases', {
         error: err instanceof Error ? err.message : String(err),

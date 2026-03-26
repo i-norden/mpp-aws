@@ -388,6 +388,8 @@ export async function getAWSPrice(
   if (!row) return null;
   return {
     priceUSD: Number(row.price_usd),
-    lastFetchedAt: new Date(row.last_fetched_at as unknown as string),
+    lastFetchedAt: row.last_fetched_at instanceof Date
+      ? row.last_fetched_at
+      : new Date(String(row.last_fetched_at)),
   };
 }

@@ -50,6 +50,19 @@ import type {
 import { deleteAllDataForAddress } from '../../db/store-gdpr.js';
 import { getTableSizes, runRetentionCleanup, type RetentionConfig } from '../../db/retention.js';
 import { isValidEthAddress } from '../../validation/index.js';
+import { errorResponse, ErrorCodes } from '../errors.js';
+import {
+  createVoucherRedemption,
+  listVoucherRedemptions,
+  updateVoucherRedemptionStatus,
+  getVoucherRedemption,
+} from '../../db/store-vouchers.js';
+import {
+  listRefunds,
+  listPendingRefunds,
+  countStuckPendingRefunds,
+} from '../../db/store-refunds.js';
+import * as metrics from '../../metrics/index.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -246,7 +259,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminListFunctions(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     try {
@@ -267,7 +280,7 @@ export function createAdminHandlers(deps: AdminDeps) {
           enabled: fn.enabled,
           estimatedCost: formatUSD(cost),
           createdAt: fn.created_at
-            ? new Date(fn.created_at as unknown as string).toISOString()
+            ? (fn.created_at instanceof Date ? fn.created_at : new Date(String(fn.created_at))).toISOString()
             : null,
         };
         if (fn.description) info.description = fn.description;
@@ -285,7 +298,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to list functions from database', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list functions' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list functions');
     }
   }
 
@@ -295,7 +308,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminRegisterFunction(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     let req: RegisterFunctionRequest;
@@ -303,32 +316,26 @@ export function createAdminHandlers(deps: AdminDeps) {
       req = await c.req.json<RegisterFunctionRequest>();
     } catch {
       log.warn('invalid register function request body');
-      return c.json({ error: 'invalid request body' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'invalid request body');
     }
 
     // Validate required fields
     if (!req.functionArn || !req.functionName || !req.description) {
-      return c.json({ error: 'invalid request body' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'invalid request body');
     }
 
     // Validate visibility
     let adminVisibility = 'public';
     if (req.visibility) {
       if (req.visibility !== 'public' && req.visibility !== 'private') {
-        return c.json({
-          error: 'invalid visibility',
-          message: "visibility must be 'public' or 'private'",
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, "visibility must be 'public' or 'private'");
       }
       adminVisibility = req.visibility;
     }
 
     // Reject plain HTTP endpoints for security
     if (isInsecureHTTPEndpoint(req.functionArn)) {
-      return c.json({
-        error: 'insecure endpoint',
-        message: 'Plain HTTP endpoints are not allowed. Use HTTPS or a Lambda ARN.',
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'Plain HTTP endpoints are not allowed. Use HTTPS or a Lambda ARN.');
     }
 
     // Build function values with sensible defaults
@@ -348,10 +355,7 @@ export function createAdminHandlers(deps: AdminDeps) {
     // Validate custom base fee
     if (req.customBaseFee !== undefined && req.customBaseFee !== null) {
       if (req.customBaseFee < 0) {
-        return c.json({
-          error: 'invalid customBaseFee',
-          message: 'customBaseFee must be non-negative',
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'customBaseFee must be non-negative');
       }
     }
 
@@ -441,7 +445,7 @@ export function createAdminHandlers(deps: AdminDeps) {
         function: req.functionName,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to register function' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to register function');
     }
   }
 
@@ -451,12 +455,12 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminDeleteFunction(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const functionName = c.req.param('name');
     if (!functionName) {
-      return c.json({ error: 'function name is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'function name is required');
     }
 
     try {
@@ -480,7 +484,7 @@ export function createAdminHandlers(deps: AdminDeps) {
         function: functionName,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to disable function' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to disable function');
     }
   }
 
@@ -494,12 +498,12 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminGetStats(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const functionName = c.req.param('function');
     if (!functionName) {
-      return c.json({ error: 'function name is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'function name is required');
     }
 
     log.info('admin_stats_requested', { function: functionName });
@@ -507,10 +511,7 @@ export function createAdminHandlers(deps: AdminDeps) {
     try {
       const stats = await getAdminFunctionStats(db, functionName);
       if (!stats) {
-        return c.json({
-          error: 'no stats available',
-          message: 'No invocations found for this function',
-        }, 404);
+        return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'No invocations found for this function');
       }
 
       return c.json({
@@ -522,7 +523,7 @@ export function createAdminHandlers(deps: AdminDeps) {
         function: functionName,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to get stats' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get stats');
     }
   }
 
@@ -536,7 +537,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminListLeases(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     const filters: LeaseFilters = {
@@ -562,7 +563,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to list leases', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list leases' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list leases');
     }
   }
 
@@ -572,7 +573,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminLeaseSummary(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     try {
@@ -586,7 +587,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to get lease summary', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to get lease summary' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get lease summary');
     }
   }
 
@@ -596,12 +597,12 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminGetLease(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     const leaseId = c.req.param('id');
     if (!leaseId) {
-      return c.json({ error: 'lease ID is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'lease ID is required');
     }
 
     try {
@@ -612,7 +613,7 @@ export function createAdminHandlers(deps: AdminDeps) {
         .executeTakeFirst();
 
       if (!lease) {
-        return c.json({ error: 'lease not found' }, 404);
+        return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'lease not found');
       }
 
       return c.json(lease);
@@ -620,7 +621,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to get lease', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to get lease' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get lease');
     }
   }
 
@@ -630,23 +631,23 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminTerminateLease(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     const leaseId = c.req.param('id');
     if (!leaseId) {
-      return c.json({ error: 'lease ID is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'lease ID is required');
     }
 
     let body: { reason?: string };
     try {
       body = await c.req.json();
     } catch {
-      return c.json({ error: 'reason is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'reason is required');
     }
 
     if (!body.reason) {
-      return c.json({ error: 'reason is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'reason is required');
     }
 
     try {
@@ -662,7 +663,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to terminate lease', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: err instanceof Error ? err.message : 'failed to terminate lease' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : 'failed to terminate lease');
     }
   }
 
@@ -672,23 +673,23 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminExtendLease(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     const leaseId = c.req.param('id');
     if (!leaseId) {
-      return c.json({ error: 'lease ID is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'lease ID is required');
     }
 
     let body: { days?: number };
     try {
       body = await c.req.json();
     } catch {
-      return c.json({ error: 'days is required (1-90)' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'days is required (1-90)');
     }
 
     if (!body.days || body.days < 1 || body.days > 90) {
-      return c.json({ error: 'days is required (1-90)' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'days is required (1-90)');
     }
 
     try {
@@ -704,7 +705,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to extend lease', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: err instanceof Error ? err.message : 'failed to extend lease' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : 'failed to extend lease');
     }
   }
 
@@ -714,12 +715,12 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminDeleteLeaseData(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     const leaseId = c.req.param('id');
     if (!leaseId) {
-      return c.json({ error: 'lease ID is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'lease ID is required');
     }
 
     try {
@@ -734,7 +735,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to anonymize lease data', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: err instanceof Error ? err.message : 'failed to anonymize lease' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : 'failed to anonymize lease');
     }
   }
 
@@ -748,7 +749,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminBillingSummary(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     // Default to last 30 days
@@ -783,7 +784,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to get billing summary', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to get billing summary' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get billing summary');
     }
   }
 
@@ -793,7 +794,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminBillingInvocations(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     const filters: InvocationFilters = {
@@ -816,7 +817,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to list invocations', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list invocations' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list invocations');
     }
   }
 
@@ -826,7 +827,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminBillingRefunds(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     const filters: RefundFilters = {
@@ -847,7 +848,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to list refunds', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list refunds' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list refunds');
     }
   }
 
@@ -857,7 +858,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminBillingCredits(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     const limit = parseIntQuery(c, 'limit', 50);
@@ -874,7 +875,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to list credits', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list credits' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list credits');
     }
   }
 
@@ -884,7 +885,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminBillingEarnings(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     const limit = parseIntQuery(c, 'limit', 50);
@@ -901,7 +902,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to list earnings', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list earnings' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list earnings');
     }
   }
 
@@ -915,7 +916,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminListResources(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     try {
@@ -952,7 +953,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to list resources', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list resources' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list resources');
     }
   }
 
@@ -962,34 +963,34 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminCreateResource(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     let req: AdminResourceRequest;
     try {
       req = await c.req.json<AdminResourceRequest>();
     } catch {
-      return c.json({ error: 'invalid request body' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'invalid request body');
     }
 
     // Validate required fields
     if (!req.id || !req.displayName || !req.instanceType || !req.amiId) {
-      return c.json({ error: 'id, displayName, instanceType, and amiId are required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'id, displayName, instanceType, and amiId are required');
     }
     if (!req.vcpus || req.vcpus < 1) {
-      return c.json({ error: 'vcpus must be at least 1' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'vcpus must be at least 1');
     }
     if (!req.memoryGb || req.memoryGb <= 0) {
-      return c.json({ error: 'memoryGb must be positive' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'memoryGb must be positive');
     }
     if (!req.price1d || req.price1d < 1) {
-      return c.json({ error: 'price1d must be positive' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'price1d must be positive');
     }
     if (!req.price7d || req.price7d < 1) {
-      return c.json({ error: 'price7d must be positive' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'price7d must be positive');
     }
     if (!req.price30d || req.price30d < 1) {
-      return c.json({ error: 'price30d must be positive' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'price30d must be positive');
     }
 
     const resource = buildResourceFromRequest(req);
@@ -1019,7 +1020,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to create resource', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to create resource' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to create resource');
     }
   }
 
@@ -1029,39 +1030,39 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminUpdateResource(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     const id = c.req.param('id');
     if (!id) {
-      return c.json({ error: 'resource ID is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'resource ID is required');
     }
 
     let req: AdminResourceRequest;
     try {
       req = await c.req.json<AdminResourceRequest>();
     } catch {
-      return c.json({ error: 'invalid request body' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'invalid request body');
     }
 
     // Validate required fields
     if (!req.displayName || !req.instanceType || !req.amiId) {
-      return c.json({ error: 'displayName, instanceType, and amiId are required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'displayName, instanceType, and amiId are required');
     }
     if (!req.vcpus || req.vcpus < 1) {
-      return c.json({ error: 'vcpus must be at least 1' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'vcpus must be at least 1');
     }
     if (!req.memoryGb || req.memoryGb <= 0) {
-      return c.json({ error: 'memoryGb must be positive' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'memoryGb must be positive');
     }
     if (!req.price1d || req.price1d < 1) {
-      return c.json({ error: 'price1d must be positive' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'price1d must be positive');
     }
     if (!req.price7d || req.price7d < 1) {
-      return c.json({ error: 'price7d must be positive' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'price7d must be positive');
     }
     if (!req.price30d || req.price30d < 1) {
-      return c.json({ error: 'price30d must be positive' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'price30d must be positive');
     }
 
     // Ensure ID matches route param
@@ -1090,7 +1091,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to update resource', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to update resource' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to update resource');
     }
   }
 
@@ -1100,12 +1101,12 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminDeleteResource(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     const id = c.req.param('id');
     if (!id) {
-      return c.json({ error: 'resource ID is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'resource ID is required');
     }
 
     try {
@@ -1128,7 +1129,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to disable resource', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: err instanceof Error ? err.message : 'failed to disable resource' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : 'failed to disable resource');
     }
   }
 
@@ -1138,12 +1139,12 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminResourceUtilization(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     const id = c.req.param('id');
     if (!id) {
-      return c.json({ error: 'resource ID is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'resource ID is required');
     }
 
     try {
@@ -1157,7 +1158,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to get resource utilization', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to get utilization' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get utilization');
     }
   }
 
@@ -1171,7 +1172,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminAuditLog(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'admin store not available' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'admin store not available');
     }
 
     const filters: AuditLogFilters = {
@@ -1189,7 +1190,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to list audit logs', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list audit logs' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list audit logs');
     }
   }
 
@@ -1203,7 +1204,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminWalletBalance(c: Context): Promise<Response> {
     if (!refundService) {
-      return c.json({ error: 'refund wallet not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'refund wallet not configured');
     }
 
     try {
@@ -1223,7 +1224,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to get wallet balance', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to get wallet balance' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get wallet balance');
     }
   }
 
@@ -1233,12 +1234,12 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminCollectionBalance(c: Context): Promise<Response> {
     if (!refundService) {
-      return c.json({ error: 'wallet service not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'wallet service not configured');
     }
 
     const payToAddr = config.payToAddress;
     if (!payToAddr) {
-      return c.json({ error: 'PAY_TO_ADDRESS not configured' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'PAY_TO_ADDRESS not configured');
     }
 
     try {
@@ -1259,7 +1260,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to get collection balance', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to get collection balance' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get collection balance');
     }
   }
 
@@ -1352,10 +1353,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
       return c.json(snap);
     } catch (err) {
-      return c.json({
-        error: 'failed to gather metrics',
-        message: err instanceof Error ? err.message : String(err),
-      }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -1370,7 +1368,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminRunReconciliation(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const fromStr = c.req.query('from') || '';
@@ -1382,7 +1380,7 @@ export function createAdminHandlers(deps: AdminDeps) {
     if (fromStr) {
       from = new Date(fromStr);
       if (Number.isNaN(from.getTime())) {
-        return c.json({ error: "invalid 'from' time format, use RFC3339" }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, "invalid 'from' time format, use RFC3339");
       }
     } else {
       from = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // default: last 7 days
@@ -1391,7 +1389,7 @@ export function createAdminHandlers(deps: AdminDeps) {
     if (toStr) {
       to = new Date(toStr);
       if (Number.isNaN(to.getTime())) {
-        return c.json({ error: "invalid 'to' time format, use RFC3339" }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, "invalid 'to' time format, use RFC3339");
       }
     } else {
       to = new Date();
@@ -1503,7 +1501,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('reconciliation_run_failed', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'reconciliation failed' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'reconciliation failed');
     }
   }
 
@@ -1513,10 +1511,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminGetReconciliation(c: Context): Promise<Response> {
     if (!latestReconciliationReport) {
-      return c.json(
-        { error: 'no reconciliation report available, run POST /admin/reconciliation/run first' },
-        404,
-      );
+      return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'no reconciliation report available, run POST /admin/reconciliation/run first');
     }
     return c.json(latestReconciliationReport);
   }
@@ -1574,19 +1569,19 @@ export function createAdminHandlers(deps: AdminDeps) {
   ): Promise<Response> {
     const treasuryAddress = config.treasuryAddress;
     if (!treasuryAddress) {
-      return c.json({ error: 'TREASURY_ADDRESS not configured' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'TREASURY_ADDRESS not configured');
     }
 
     let req: SweepRequest;
     try {
       req = await c.req.json<SweepRequest>();
     } catch {
-      return c.json({ error: 'invalid request body: amount (string) and confirm (bool) required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'invalid request body: amount (string) and confirm (bool) required');
     }
 
     const asset = req.asset || 'usdc';
     if (asset !== 'usdc' && asset !== 'eth') {
-      return c.json({ error: "asset must be 'usdc' or 'eth'" }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, "asset must be 'usdc' or 'eth'");
     }
 
     let amount: bigint;
@@ -1594,7 +1589,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       amount = BigInt(req.amount);
       if (amount <= 0n) throw new Error('non-positive');
     } catch {
-      return c.json({ error: 'amount must be a positive integer string' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'amount must be a positive integer string');
     }
 
     // Dry run
@@ -1652,9 +1647,7 @@ export function createAdminHandlers(deps: AdminDeps) {
         wallet: walletName,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({
-        error: 'sweep transaction failed: ' + (err instanceof Error ? err.message : String(err)),
-      }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'sweep transaction failed: ' + (err instanceof Error ? err.message : String(err)));
     }
   }
 
@@ -1665,7 +1658,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminWalletSweep(c: Context): Promise<Response> {
     if (!refundService) {
-      return c.json({ error: 'refund wallet not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'refund wallet not configured');
     }
     return handleWalletSweep(c, refundService, 'refund');
   }
@@ -1677,7 +1670,7 @@ export function createAdminHandlers(deps: AdminDeps) {
 
   async function handleAdminCollectionSweep(c: Context): Promise<Response> {
     if (!collectionService) {
-      return c.json({ error: 'collection wallet not configured (COLLECTION_PRIVATE_KEY not set)' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'collection wallet not configured (COLLECTION_PRIVATE_KEY not set)');
     }
     return handleWalletSweep(c, collectionService, 'collection');
   }
@@ -1726,12 +1719,12 @@ export function createAdminHandlers(deps: AdminDeps) {
   // =========================================================================
 
   async function handleAdminGDPRDelete(c: Context): Promise<Response> {
-    if (!db) return c.json({ error: 'database not configured' }, 503);
+    if (!db) return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
 
     const body = await c.req.json<{ address?: string }>().catch(() => ({} as { address?: string }));
     const address = body.address?.trim().toLowerCase();
     if (!address || !isValidEthAddress(address)) {
-      return c.json({ error: 'valid Ethereum address is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'valid Ethereum address is required');
     }
 
     try {
@@ -1752,12 +1745,12 @@ export function createAdminHandlers(deps: AdminDeps) {
         address,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'GDPR deletion failed' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'GDPR deletion failed');
     }
   }
 
   async function handleAdminTableSizes(c: Context): Promise<Response> {
-    if (!db) return c.json({ error: 'database not configured' }, 503);
+    if (!db) return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
 
     try {
       const sizes = await getTableSizes(db);
@@ -1766,12 +1759,12 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('failed to get table sizes', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to get table sizes' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get table sizes');
     }
   }
 
   async function handleAdminRunRetention(c: Context): Promise<Response> {
-    if (!db) return c.json({ error: 'database not configured' }, 503);
+    if (!db) return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
 
     const retentionCfg: RetentionConfig = {
       invocationRetentionDays: config.invocationRetentionDays,
@@ -1799,7 +1792,154 @@ export function createAdminHandlers(deps: AdminDeps) {
       log.error('retention cleanup failed', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'retention cleanup failed' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'retention cleanup failed');
+    }
+  }
+
+  // =========================================================================
+  // Voucher Admin
+  // =========================================================================
+
+  async function handleAdminCreateVoucher(c: Context): Promise<Response> {
+    if (!db) return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
+
+    const body = await c.req.json<{
+      voucher_id?: string;
+      source?: string;
+      amount?: string;
+      expires_in_hours?: number;
+    }>().catch(() => ({} as Record<string, unknown>));
+
+    const voucherId = (body.voucher_id as string)?.trim();
+    if (!voucherId) return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'voucher_id is required');
+
+    let amount: bigint;
+    try {
+      amount = BigInt(body.amount as string);
+      if (amount <= 0n) throw new Error('must be positive');
+    } catch {
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'amount must be a positive integer (atomic USDC)');
+    }
+
+    const source = (body.source as string)?.trim() || 'admin';
+    const expiresInHours = (body.expires_in_hours as number) || 720; // 30 days default
+    const expiresAt = new Date(Date.now() + expiresInHours * 60 * 60 * 1000);
+
+    try {
+      const id = await createVoucherRedemption(db, {
+        voucherId,
+        source,
+        payerAddress: '', // Not yet redeemed
+        amount,
+        issuedAt: new Date(),
+        expiresAt,
+        status: 'pending',
+      });
+
+      await createAuditEntry(db, {
+        admin_ip: c.req.header('X-Forwarded-For') ?? 'unknown',
+        action: 'voucher.create',
+        target_type: 'voucher',
+        target_id: voucherId,
+        details: { amount: String(amount), expiresAt: expiresAt.toISOString() },
+      });
+
+      return c.json({ success: true, id: String(id), voucherId, amount: String(amount), expiresAt: expiresAt.toISOString() }, 201);
+    } catch (err) {
+      log.error('failed to create voucher', { voucherId, error: err instanceof Error ? err.message : String(err) });
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to create voucher');
+    }
+  }
+
+  async function handleAdminListVouchers(c: Context): Promise<Response> {
+    if (!db) return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
+
+    const status = c.req.query('status') ?? 'pending';
+    const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10) || 50, 500);
+
+    try {
+      const vouchers = await listVoucherRedemptions(db, status, limit);
+      return c.json({ vouchers, count: vouchers.length });
+    } catch (err) {
+      log.error('failed to list vouchers', { error: err instanceof Error ? err.message : String(err) });
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list vouchers');
+    }
+  }
+
+  async function handleAdminRevokeVoucher(c: Context): Promise<Response> {
+    if (!db) return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
+
+    const voucherId = c.req.param('voucherId') ?? '';
+    if (!voucherId) return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'voucher ID is required');
+
+    const existing = await getVoucherRedemption(db, voucherId);
+    if (!existing) return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'voucher not found');
+    if (existing.status === 'success') return errorResponse(c, 409, ErrorCodes.CONFLICT, 'voucher already redeemed');
+
+    try {
+      await updateVoucherRedemptionStatus(db, voucherId, 'failed');
+      await createAuditEntry(db, {
+        admin_ip: c.req.header('X-Forwarded-For') ?? 'unknown',
+        action: 'voucher.revoke',
+        target_type: 'voucher',
+        target_id: voucherId,
+        details: null,
+      });
+      return c.json({ success: true, voucherId });
+    } catch (err) {
+      log.error('failed to revoke voucher', { voucherId, error: err instanceof Error ? err.message : String(err) });
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to revoke voucher');
+    }
+  }
+
+  // =========================================================================
+  // Refund monitoring (using store functions)
+  // =========================================================================
+
+  async function handleAdminRefundMonitoring(c: Context): Promise<Response> {
+    if (!db) return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
+
+    try {
+      const pending = await listPendingRefunds(db, 50);
+      const stuckCount = await countStuckPendingRefunds(db);
+
+      // Update Prometheus gauge
+      metrics.stuckPendingRefundsGauge.set(stuckCount);
+
+      return c.json({
+        pendingRefunds: pending.length,
+        stuckPendingCount: stuckCount,
+        pendingRefundsList: pending.map(r => ({
+          id: String(r.id),
+          payerAddress: r.payer_address,
+          amount: String(r.amount),
+          txHash: r.refund_tx_hash,
+          createdAt: r.created_at,
+        })),
+      });
+    } catch (err) {
+      log.error('failed to get refund monitoring data', { error: err instanceof Error ? err.message : String(err) });
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get refund monitoring');
+    }
+  }
+
+  async function handleAdminRefundHistory(c: Context): Promise<Response> {
+    if (!db) return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
+
+    const address = (c.req.query('address') ?? '').toLowerCase();
+    if (!address || !isValidEthAddress(address)) {
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'valid address query parameter is required');
+    }
+
+    const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10) || 50, 500);
+    const offset = parseInt(c.req.query('offset') ?? '0', 10) || 0;
+
+    try {
+      const refunds = await listRefunds(db, address, limit, offset);
+      return c.json({ refunds, count: refunds.length });
+    } catch (err) {
+      log.error('failed to list refunds', { address, error: err instanceof Error ? err.message : String(err) });
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list refunds');
     }
   }
 
@@ -1859,5 +1999,14 @@ export function createAdminHandlers(deps: AdminDeps) {
     handleAdminGDPRDelete,
     handleAdminTableSizes,
     handleAdminRunRetention,
+
+    // Vouchers
+    handleAdminCreateVoucher,
+    handleAdminListVouchers,
+    handleAdminRevokeVoucher,
+
+    // Refund monitoring
+    handleAdminRefundMonitoring,
+    handleAdminRefundHistory,
   };
 }

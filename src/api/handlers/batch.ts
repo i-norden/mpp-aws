@@ -19,9 +19,8 @@ import { getPaymentInfo } from '../middleware/mpp.js';
 import { createBatchInvocation, updateBatchInvocation } from '../../db/store-batch.js';
 import * as log from '../../logging/index.js';
 import { applyToRequest, decrypt } from '../../endpoint-auth/index.js';
-import { HttpError } from '../errors.js';
+import { HttpError, errorResponse, ErrorCodes } from '../errors.js';
 import { readJsonBody } from '../request-body.js';
-import { jsonWithStatus } from '../response.js';
 import {
   assertFunctionInvocationAccess,
   resolveFunctionForRequest,
@@ -123,7 +122,7 @@ export function createBatchHandlers(deps: BatchDeps) {
       perItemAmount = resolved.amount;
     } catch (err) {
       if (err instanceof HttpError) {
-        return jsonWithStatus(c, { error: err.message, details: err.details }, err.status);
+        return errorResponse(c, err.status, ErrorCodes.INTERNAL_ERROR, err.message, err.details);
       }
       throw err;
     }
@@ -131,13 +130,13 @@ export function createBatchHandlers(deps: BatchDeps) {
     // 3. Get payment info
     const paymentInfo = getPaymentInfo(c);
     if (!paymentInfo) {
-      return c.json({ error: 'payment info missing' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'payment info missing');
     }
 
     // 4. Parse request body
     const req = await readJsonBody<BatchInvokeRequest>(c);
     if (!Array.isArray(req.inputs) || req.inputs.length === 0 || req.inputs.length > 100) {
-      return c.json({ error: 'inputs must contain 1-100 items' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'inputs must contain 1-100 items');
     }
 
     // 5. Access control check for private functions
@@ -150,30 +149,21 @@ export function createBatchHandlers(deps: BatchDeps) {
       );
     } catch (err) {
       if (err instanceof HttpError) {
-        return jsonWithStatus(c, {
-          error: err.status === 403 ? 'access denied' : 'failed to verify access authorization',
-          function: functionName,
-          message: err.message,
-        }, err.status);
+        const code = err.status === 403 ? ErrorCodes.FORBIDDEN : ErrorCodes.INTERNAL_ERROR;
+        return errorResponse(c, err.status, code, err.message, { function: functionName });
       }
       throw err;
     }
 
     const expectedAmount = perItemAmount * BigInt(req.inputs.length);
     if (paymentInfo.amount !== expectedAmount) {
-      return c.json({
-        error: 'payment amount mismatch',
-        message: 'Batch payment amount no longer matches the exact request size.',
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'Batch payment amount no longer matches the exact request size.');
     }
 
     // 6. Reject insecure HTTP endpoints
     const isHTTP = dbFunction !== null && isHTTPEndpoint(dbFunction.function_arn);
     if (dbFunction && dbFunction.function_arn.startsWith('http://') && !dbFunction.function_arn.startsWith('https://')) {
-      return c.json({
-        error: 'insecure_endpoint',
-        message: 'Plain HTTP endpoints are not supported. Use HTTPS.',
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'Plain HTTP endpoints are not supported. Use HTTPS.');
     }
 
     // 7. Determine concurrency
