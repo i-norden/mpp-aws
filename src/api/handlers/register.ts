@@ -14,7 +14,7 @@ import type { Database, LambdaFunctionTable } from '../../db/types.js';
 import type { Config } from '../../config/index.js';
 import type { PricingEngine } from '../../pricing/engine.js';
 import { getPaymentInfo } from '../middleware/mpp.js';
-import { validateEthAddress } from '../../validation/index.js';
+import { validateEthAddress, isValidEthAddress } from '../../validation/index.js';
 import {
   performPinnedHttpsRequest,
   resolvePublicHostname,
@@ -547,6 +547,13 @@ export function createRegisterHandlers(deps: RegisterDeps) {
       for (const addr of req.allowedInvokers) {
         const trimmed = addr.trim().toLowerCase();
         if (!trimmed) continue;
+        if (!isValidEthAddress(trimmed)) {
+          log.warn('skipping invalid invoker address during registration', {
+            function: functionID,
+            address: trimmed,
+          });
+          continue;
+        }
         try {
           await db.insertInto('function_access_list').values({
             function_name: functionID,

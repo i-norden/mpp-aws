@@ -136,7 +136,9 @@ export class PriceCalculator {
     if (!row) return null;
     return {
       price_usd: Number(row.price_usd),
-      last_fetched_at: new Date(row.last_fetched_at as unknown as string),
+      last_fetched_at: row.last_fetched_at instanceof Date
+        ? row.last_fetched_at
+        : new Date(String(row.last_fetched_at)),
     };
   }
 

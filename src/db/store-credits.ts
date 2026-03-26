@@ -68,6 +68,48 @@ export async function getCreditBalance(
   };
 }
 
+/** Options for listing credits. */
+export interface ListCreditsOptions {
+  limit: number;
+  offset?: number;
+  /** Cursor-based pagination: return credits created before this date. */
+  cursor?: Date;
+  /** If false (default), exclude withdrawn credits. If true, include all. */
+  includeRedeemed?: boolean;
+}
+
+/**
+ * List credits for a payer address with configurable pagination.
+ * Supports both offset-based and cursor-based (keyset) pagination.
+ * Cursor-based pagination is more efficient for large datasets.
+ */
+export async function listCredits(
+  db: Kysely<Database>,
+  payerAddress: string,
+  opts: ListCreditsOptions,
+): Promise<Credit[]> {
+  let query = db
+    .selectFrom("credits")
+    .selectAll()
+    .where("payer_address", "=", payerAddress);
+
+  if (!opts.includeRedeemed) {
+    query = query.where("withdrawal_status", "!=", "withdrawn");
+  }
+
+  if (opts.cursor) {
+    query = query.where("created_at", "<", opts.cursor);
+  }
+
+  query = query.orderBy("created_at", "desc").limit(opts.limit);
+
+  if (opts.offset && !opts.cursor) {
+    query = query.offset(opts.offset);
+  }
+
+  return query.execute();
+}
+
 /**
  * Atomically reserve all available credits for a payer address by marking
  * them as `pending` withdrawal.  Returns the total amount reserved.

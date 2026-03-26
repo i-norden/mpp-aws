@@ -184,6 +184,48 @@ export const authFailuresTotal = new client.Counter({
   labelNames: ['auth_type'] as const,
 });
 
+// --- Data Retention & GDPR Metrics ---
+
+export const retentionRowsDeleted = new client.Counter({
+  name: 'lambda_proxy_retention_rows_deleted_total',
+  help: 'Total rows deleted by retention cleanup',
+  labelNames: ['table'] as const,
+});
+
+export const retentionRunDuration = new client.Histogram({
+  name: 'lambda_proxy_retention_run_duration_seconds',
+  help: 'Duration of retention cleanup runs',
+  buckets: [0.1, 0.5, 1, 5, 10, 30, 60],
+});
+
+export const gdprDeletionsTotal = new client.Counter({
+  name: 'lambda_proxy_gdpr_deletions_total',
+  help: 'Total GDPR right-to-erasure deletion requests processed',
+  labelNames: ['status'] as const,
+});
+
+// --- Voucher Metrics ---
+
+export const voucherRedemptionsTotal = new client.Counter({
+  name: 'lambda_proxy_voucher_redemptions_total',
+  help: 'Total voucher redemptions',
+  labelNames: ['status'] as const,
+});
+
+// --- Table Size Metrics ---
+
+export const tableSizeBytes = new client.Gauge({
+  name: 'lambda_proxy_table_size_bytes',
+  help: 'Approximate total size of database tables in bytes',
+  labelNames: ['table'] as const,
+});
+
+export const tableEstimatedRows = new client.Gauge({
+  name: 'lambda_proxy_table_estimated_rows',
+  help: 'Approximate row count of database tables',
+  labelNames: ['table'] as const,
+});
+
 // --- Helper functions matching Go's metrics package ---
 
 export function recordInvocation(fn: string, success: boolean, durationSeconds: number, amountPaid: bigint) {

@@ -20,6 +20,12 @@ import type { OFACChecker } from '../../ofac/checker.js';
 import { verifyAddressOwnershipWithReplay } from '../../auth/signature.js';
 import { validateEthAddress } from '../../validation/index.js';
 import { getCreditBalance } from '../../db/store-credits.js';
+import { createCredit } from '../../db/store-credits.js';
+import {
+  getVoucherRedemption,
+  tryCreateVoucherRedemption,
+  updateVoucherRedemptionStatus,
+} from '../../db/store-vouchers.js';
 import * as log from '../../logging/index.js';
 import { jsonWithStatus } from '../response.js';
 
@@ -66,7 +72,7 @@ async function verifyOwnership(
       error: 'authentication required',
       message: 'X-Signature and X-Message headers are required to access credit information',
       hint: "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet",
-    }, 401) as unknown as Response;
+    }, 401);
     return false;
   }
 
@@ -75,7 +81,7 @@ async function verifyOwnership(
     c.res = jsonWithStatus(c, {
       error: 'authentication failed',
       message: result.errorMessage,
-    }, result.statusCode ?? 401) as unknown as Response;
+    }, result.statusCode ?? 401);
     return false;
   }
 
@@ -333,9 +339,110 @@ export function createCreditsHandlers(deps: CreditsDeps) {
     });
   }
 
+  // -------------------------------------------------------------------
+  // handleRedeemVoucher -- POST /credits/:address/voucher
+  // -------------------------------------------------------------------
+
+  async function handleRedeemVoucher(c: Context): Promise<Response> {
+    if (!db) {
+      return c.json({ error: 'database not configured' }, 503);
+    }
+
+    const address = (c.req.param('address') ?? '').toLowerCase();
+    try {
+      validateEthAddress(address, 'address');
+    } catch {
+      return c.json({ error: 'invalid address format' }, 400);
+    }
+
+    if (!(await verifyOwnership(c, db, address))) {
+      return c.res;
+    }
+
+    // OFAC compliance check
+    if (ofacChecker && ofacChecker.isBlocked(address)) {
+      return c.json({ error: 'address is blocked by compliance policy' }, 403);
+    }
+
+    const body = await c.req.json<{
+      voucher_id?: string;
+    }>().catch(() => ({} as { voucher_id?: string }));
+
+    const voucherId = body.voucher_id?.trim();
+    if (!voucherId) {
+      return c.json({ error: 'voucher_id is required' }, 400);
+    }
+
+    // Check if voucher was already redeemed
+    const existing = await getVoucherRedemption(db, voucherId);
+    if (existing) {
+      if (existing.status === 'success') {
+        return c.json({ error: 'voucher already redeemed' }, 409);
+      }
+      if (existing.status === 'pending') {
+        return c.json({ error: 'voucher redemption already in progress' }, 409);
+      }
+    }
+
+    // Try to atomically create the redemption
+    const { created } = await tryCreateVoucherRedemption(db, {
+      voucherId,
+      source: 'api',
+      payerAddress: address,
+      amount: existing?.amount ?? 0n, // Amount from voucher system
+      issuedAt: new Date(),
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24h default
+      status: 'pending',
+    });
+
+    if (!created) {
+      return c.json({ error: 'voucher already redeemed' }, 409);
+    }
+
+    // Retrieve the redemption to get the full record
+    const redemption = await getVoucherRedemption(db, voucherId);
+    if (!redemption) {
+      return c.json({ error: 'failed to process voucher' }, 500);
+    }
+
+    // Check expiry
+    if (new Date(redemption.expires_at) < new Date()) {
+      await updateVoucherRedemptionStatus(db, voucherId, 'failed');
+      return c.json({ error: 'voucher has expired' }, 410);
+    }
+
+    // Create a credit for the voucher amount
+    try {
+      await createCredit(db, {
+        payer_address: address,
+        amount: redemption.amount,
+        reason: 'voucher_redemption',
+        source_tx_hash: null,
+        source_invocation_id: null,
+      });
+      await updateVoucherRedemptionStatus(db, voucherId, 'success');
+    } catch (err) {
+      log.error('failed to create credit for voucher redemption', {
+        voucherId,
+        payer: address,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await updateVoucherRedemptionStatus(db, voucherId, 'failed');
+      return c.json({ error: 'failed to process voucher redemption' }, 500);
+    }
+
+    return c.json({
+      success: true,
+      voucherId,
+      amount: String(redemption.amount),
+      amountUSD: formatUSD(redemption.amount),
+    });
+  }
+
   return {
     handleGetCredits,
     handleListCredits,
     handleRedeemCredits,
+    handleRedeemVoucher,
   };
 }

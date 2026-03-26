@@ -83,6 +83,12 @@ function createTestConfig(): Config {
     rpcURLFallback: '',
     treasuryAddress: '',
     usdcAddress: '0x00000000000000000000000000000000000000bb',
+    invocationRetentionDays: 365,
+    nonceRetentionDays: 90,
+    creditRetentionDays: 365,
+    voucherRetentionDays: 365,
+    leaseAnonymizeDays: 90,
+    retentionBatchSize: 1000,
   };
 }
 

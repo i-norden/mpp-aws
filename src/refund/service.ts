@@ -491,6 +491,38 @@ export class RefundService {
   }
 
   // -----------------------------------------------------------------------
+  // Receipt checking (for recovery of unconfirmed refunds)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Check the on-chain receipt for a transaction hash.
+   * Returns { confirmed, failed, gasUsed } based on the receipt status.
+   * Throws if the receipt cannot be fetched (e.g., network error).
+   */
+  async checkReceipt(txHash: string): Promise<{
+    confirmed: boolean;
+    failed: boolean;
+    gasUsed?: bigint;
+  }> {
+    try {
+      const receipt = await this.publicClient.getTransactionReceipt({
+        hash: txHash as Hex,
+      });
+      return {
+        confirmed: receipt.status === 'success',
+        failed: receipt.status === 'reverted',
+        gasUsed: receipt.gasUsed,
+      };
+    } catch (err) {
+      // Transaction receipt not found -- tx may still be pending
+      if (err instanceof Error && err.message.includes('could not be found')) {
+        return { confirmed: false, failed: false };
+      }
+      throw err;
+    }
+  }
+
+  // -----------------------------------------------------------------------
   // Lifecycle
   // -----------------------------------------------------------------------
 

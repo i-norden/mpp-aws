@@ -616,7 +616,7 @@ async function processMeteredHTTPBilling(
   }
 
   // Credit owner earnings
-  if (ownerEarning > 0n && dbFunction.owner_address) {
+  if (ownerEarning > 0n && dbFunction.owner_address && dbFunction.owner_address.trim() !== '') {
     try {
       await db.insertInto('earnings').values({
         owner_address: dbFunction.owner_address,

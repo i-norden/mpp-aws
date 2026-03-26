@@ -142,6 +142,14 @@ export interface Config {
   // Caching & Nonce TTL
   functionCacheTTLSeconds: number;
   nonceExpirationHours: number;
+
+  // Data Retention
+  invocationRetentionDays: number;
+  nonceRetentionDays: number;
+  creditRetentionDays: number;
+  voucherRetentionDays: number;
+  leaseAnonymizeDays: number;
+  retentionBatchSize: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +385,14 @@ export function loadConfig(): Config {
     // Caching & Nonce TTL
     functionCacheTTLSeconds: getEnvInt('FUNCTION_CACHE_TTL_SECONDS', 60),
     nonceExpirationHours: getEnvInt('NONCE_EXPIRATION_HOURS', 24),
+
+    // Data Retention
+    invocationRetentionDays: getEnvInt('INVOCATION_RETENTION_DAYS', 365),
+    nonceRetentionDays: getEnvInt('NONCE_RETENTION_DAYS', 90),
+    creditRetentionDays: getEnvInt('CREDIT_RETENTION_DAYS', 365),
+    voucherRetentionDays: getEnvInt('VOUCHER_RETENTION_DAYS', 365),
+    leaseAnonymizeDays: getEnvInt('LEASE_ANONYMIZE_DAYS', 90),
+    retentionBatchSize: getEnvInt('RETENTION_BATCH_SIZE', 1000),
   };
 
   return cfg;
@@ -419,10 +435,25 @@ export function validate(cfg: Config): void {
     throw new ConfigValidationError('GLOBAL_RATE_BURST must be positive');
   }
 
+  // Validate rate limit burst >= rate
+  if (cfg.globalRateBurst < cfg.globalRateLimit) {
+    throw new ConfigValidationError('GLOBAL_RATE_BURST must be >= GLOBAL_RATE_LIMIT');
+  }
+  if (cfg.perAddressRateBurst < cfg.perAddressRateLimit) {
+    throw new ConfigValidationError('PER_ADDRESS_RATE_BURST must be >= PER_ADDRESS_RATE_LIMIT');
+  }
+
   // Validate refund configuration
   if (cfg.refundEnabled) {
     if (cfg.refundPrivateKey === '') {
       throw new ConfigValidationError('REFUND_PRIVATE_KEY is required when REFUND_ENABLED=true');
+    }
+    // Validate private key is valid hex (with or without 0x prefix)
+    const rawKey = cfg.refundPrivateKey.startsWith('0x')
+      ? cfg.refundPrivateKey.slice(2)
+      : cfg.refundPrivateKey;
+    if (!/^[0-9a-fA-F]{64}$/.test(rawKey)) {
+      throw new ConfigValidationError('REFUND_PRIVATE_KEY must be a valid 32-byte hex string (64 hex chars, with optional 0x prefix)');
     }
     if (cfg.rpcURL === '') {
       throw new ConfigValidationError('RPC_URL is required when REFUND_ENABLED=true');
@@ -478,6 +509,13 @@ export function validate(cfg: Config): void {
     }
     if (cfg.leaseMaxGlobalActive < 1) {
       throw new ConfigValidationError('LEASE_MAX_GLOBAL_ACTIVE must be set to a positive value when LEASE_ENABLED=true (controls maximum total AWS spend)');
+    }
+  }
+
+  // Validate async jobs configuration
+  if (cfg.asyncJobsEnabled) {
+    if (cfg.databaseURL === '') {
+      throw new ConfigValidationError('DATABASE_URL is required when ASYNC_JOBS_ENABLED=true');
     }
   }
 }

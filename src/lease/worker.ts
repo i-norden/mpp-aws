@@ -154,7 +154,11 @@ export class ProvisioningWorker {
     if (this.intervalHandle) return;
     log.info('ProvisioningWorker started', { intervalMs });
     this.intervalHandle = setInterval(() => {
-      void this.tick();
+      this.tick().catch((err) => {
+        log.error('ProvisioningWorker tick failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     }, intervalMs);
   }
 
