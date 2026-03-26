@@ -139,6 +139,7 @@ jobs:
           ignore-unfixed: true
           vuln-type: os,library
           severity: CRITICAL,HIGH
+          scanners: vuln
 
       - name: Upload Trivy SARIF
         if: always()
@@ -151,6 +152,7 @@ jobs:
           ignore-unfixed: true
           vuln-type: os,library
           severity: CRITICAL,HIGH
+          scanners: vuln
 
       - name: Upload Trivy SARIF to GitHub Security
         if: always()
@@ -179,6 +181,7 @@ jobs:
           input: mmp-aws-image.tar
           format: cyclonedx
           output: sbom.json
+          scanners: vuln
 
       - name: Upload SBOM artifact
         if: github.event_name == 'push'
