@@ -1,4 +1,4 @@
-# mmp-aws
+# mpp-aws
 
 Pay-per-use AWS compute marketplace powered by [MPP](https://github.com/tempoxyz/mpp) (Machine Payments Protocol). Clients pay for Lambda invocations and EC2 leases with USDC via the HTTP 402 flow.
 
@@ -39,7 +39,6 @@ All configuration is via environment variables. See [.env.example](.env.example)
 **Required:**
 - `PAY_TO_ADDRESS` -- Ethereum address that receives payments
 - `DATABASE_URL` -- PostgreSQL connection string
-- `FACILITATOR_URL` -- MPP settlement service endpoint
 
 **Optional (enable features):**
 - `REFUND_ENABLED=true` + `REFUND_PRIVATE_KEY` -- automatic overpayment refunds

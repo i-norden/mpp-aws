@@ -195,7 +195,7 @@ export function createFunctionsHandlers(deps: FunctionsDeps) {
           if (tags.length > 0) {
             // Filter by tags using array overlap (&&)
             query = query.where(
-              sql<SqlBool>`tags && ${sql.lit(`{${tags.join(',')}}`)}::text[]`,
+              sql<SqlBool>`tags && ARRAY[${sql.join(tags)}]::text[]`,
             );
           }
         }

@@ -82,8 +82,7 @@ export interface RunMigrationsOutput {
 /**
  * Run all pending up-migrations against the provided Kysely instance.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export async function runMigrations(db: Kysely<any>): Promise<RunMigrationsOutput> {
+export async function runMigrations<T>(db: Kysely<T>): Promise<RunMigrationsOutput> {
   const migrator = new Migrator({
     db,
     provider: new SqlFileMigrationProvider(),
@@ -107,8 +106,7 @@ export async function runMigrations(db: Kysely<any>): Promise<RunMigrationsOutpu
 /**
  * Roll back the most recent migration.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export async function rollbackMigration(db: Kysely<any>): Promise<RunMigrationsOutput> {
+export async function rollbackMigration<T>(db: Kysely<T>): Promise<RunMigrationsOutput> {
   const migrator = new Migrator({
     db,
     provider: new SqlFileMigrationProvider(),

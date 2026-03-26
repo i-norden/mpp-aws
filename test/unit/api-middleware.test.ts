@@ -32,7 +32,6 @@ function createTestConfig(): Config {
     enforceWhitelist: false,
     estimatedGasCostUSD: 10n,
     durationRatePer100ms: 100n,
-    facilitatorURL: 'https://facilitator.example.com',
     feePercentage: 10n,
     functionCacheTTLSeconds: 60,
     globalRateBurst: 10,
