@@ -51,6 +51,11 @@ export interface EndpointAuth {
   headerValue?: string;
 }
 
+export interface AppliedEndpointAuth {
+  url: string;
+  headers: Record<string, string>;
+}
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -106,6 +111,52 @@ export function validate(auth: EndpointAuth): void {
         `unsupported auth type: "${auth.type}" (must be bearer, api_key, basic, or custom_header)`,
       );
   }
+}
+
+export function applyToRequest(
+  auth: EndpointAuth,
+  requestURL: string,
+): AppliedEndpointAuth {
+  const headers: Record<string, string> = {};
+  const url = new URL(requestURL);
+
+  switch (auth.type) {
+    case AUTH_TYPE_BEARER:
+      if (auth.token) {
+        headers['Authorization'] = `Bearer ${auth.token}`;
+      }
+      break;
+
+    case AUTH_TYPE_API_KEY:
+      if (auth.keyName && auth.keyValue) {
+        if (auth.keyLocation === 'query') {
+          url.searchParams.set(auth.keyName, auth.keyValue);
+        } else {
+          headers[auth.keyName] = auth.keyValue;
+        }
+      }
+      break;
+
+    case AUTH_TYPE_BASIC:
+      if (auth.username && auth.password) {
+        const encoded = Buffer.from(
+          `${auth.username}:${auth.password}`,
+        ).toString('base64');
+        headers['Authorization'] = `Basic ${encoded}`;
+      }
+      break;
+
+    case AUTH_TYPE_CUSTOM_HEADER:
+      if (auth.headerName && auth.headerValue) {
+        headers[auth.headerName] = auth.headerValue;
+      }
+      break;
+  }
+
+  return {
+    url: url.toString(),
+    headers,
+  };
 }
 
 // ---------------------------------------------------------------------------

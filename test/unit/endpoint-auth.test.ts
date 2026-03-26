@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { randomBytes } from 'node:crypto';
 
 import {
+  applyToRequest,
   validate,
   encrypt,
   decrypt,
@@ -83,6 +84,41 @@ describe('endpoint-auth', () => {
 
     it('rejects unsupported auth type', () => {
       expect(() => validate({ type: 'oauth' as 'bearer' })).toThrow('unsupported auth type');
+    });
+  });
+
+  describe('applyToRequest', () => {
+    it('applies api_key auth to a header by default', () => {
+      const applied = applyToRequest({
+        type: AUTH_TYPE_API_KEY,
+        keyName: 'X-API-Key',
+        keyValue: 'secret123',
+      }, 'https://example.com/invoke');
+
+      expect(applied.url).toBe('https://example.com/invoke');
+      expect(applied.headers).toEqual({ 'X-API-Key': 'secret123' });
+    });
+
+    it('applies api_key auth to the query string when configured', () => {
+      const applied = applyToRequest({
+        type: AUTH_TYPE_API_KEY,
+        keyName: 'api_key',
+        keyValue: 'secret123',
+        keyLocation: 'query',
+      }, 'https://example.com/invoke?existing=1');
+
+      expect(applied.url).toBe('https://example.com/invoke?existing=1&api_key=secret123');
+      expect(applied.headers).toEqual({});
+    });
+
+    it('preserves existing query parameters when applying bearer auth', () => {
+      const applied = applyToRequest({
+        type: AUTH_TYPE_BEARER,
+        token: 'token-123',
+      }, 'https://example.com/invoke?existing=1');
+
+      expect(applied.url).toBe('https://example.com/invoke?existing=1');
+      expect(applied.headers).toEqual({ Authorization: 'Bearer token-123' });
     });
   });
 

@@ -17,7 +17,7 @@
 
 import type { Context } from 'hono';
 import type { Kysely } from 'kysely';
-import type { Database, LambdaFunctionTable } from '../../db/types.js';
+import type { Database } from '../../db/types.js';
 import type { Config } from '../../config/index.js';
 import type { PricingEngine } from '../../pricing/engine.js';
 import type {
@@ -30,26 +30,20 @@ import { CircuitBreaker } from '../../circuit-breaker/index.js';
 import { getPaymentInfo } from '../middleware/mpp.js';
 import type { PaymentInfo } from '../../mpp/types.js';
 import { normalizeEthAddress } from '../../validation/index.js';
-import { getFunction } from '../../db/store-functions.js';
 import { createInvocation } from '../../db/store-invocations.js';
 import * as log from '../../logging/index.js';
 import * as metrics from '../../metrics/index.js';
 import type { OFACChecker } from '../../ofac/checker.js';
-import type { Selectable } from 'kysely';
+import { applyToRequest, decrypt } from '../../endpoint-auth/index.js';
+import { readJsonBody } from '../request-body.js';
+import { HttpError } from '../errors.js';
+import { jsonWithStatus } from '../response.js';
 import {
-  decrypt,
-  type EndpointAuth,
-  AUTH_TYPE_BEARER,
-  AUTH_TYPE_API_KEY,
-  AUTH_TYPE_BASIC,
-  AUTH_TYPE_CUSTOM_HEADER,
-} from '../../endpoint-auth/index.js';
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-type LambdaFunction = Selectable<LambdaFunctionTable>;
+  assertFunctionInvocationAccess,
+  invalidateFunctionCache,
+  resolveFunctionForRequest,
+  type LambdaFunction,
+} from '../function-registry.js';
 
 export interface InvokeDeps {
   db: Kysely<Database> | null;
@@ -99,16 +93,6 @@ interface BillingDetails {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Matches Go's safeFunctionNamePattern: alphanumeric, hyphens, underscores, max 170 chars. */
-const SAFE_FUNCTION_NAME_RE = /^[a-zA-Z0-9_-]{1,170}$/;
-
-function normalizeFunctionName(name: string): string {
-  const trimmed = name.trim();
-  if (!trimmed) return '';
-  if (!SAFE_FUNCTION_NAME_RE.test(trimmed)) return '';
-  return trimmed.toLowerCase();
-}
-
 /** Check if a function ARN is an HTTPS endpoint URL. */
 function isHTTPEndpoint(arn: string): boolean {
   return arn.startsWith('https://');
@@ -128,82 +112,7 @@ function formatUSD(atomicAmount: bigint): string {
 
 /** Parse a JSON body; tolerate empty body by returning empty object. */
 async function parseInvokeBody(c: Context): Promise<InvokeRequest> {
-  try {
-    const body = await c.req.json();
-    return body as InvokeRequest;
-  } catch {
-    // Empty body or invalid JSON -- return empty request (matches Go's ShouldBindJSON tolerating EOF)
-    return {};
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Function cache (in-memory, mirrors Go's sync.Map + TTL)
-// ---------------------------------------------------------------------------
-
-interface CachedFunction {
-  fn: LambdaFunction;
-  expiresAt: number;
-}
-
-const functionCache = new Map<string, CachedFunction>();
-
-function getCachedFunction(name: string): LambdaFunction | null {
-  const cached = functionCache.get(name);
-  if (cached && Date.now() < cached.expiresAt) {
-    return cached.fn;
-  }
-  if (cached) {
-    functionCache.delete(name);
-  }
-  return null;
-}
-
-function setCachedFunction(name: string, fn: LambdaFunction, ttlSeconds: number): void {
-  functionCache.set(name, {
-    fn,
-    expiresAt: Date.now() + ttlSeconds * 1000,
-  });
-}
-
-function invalidateFunctionCache(name: string): void {
-  functionCache.delete(name);
-}
-
-// ---------------------------------------------------------------------------
-// Endpoint auth helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Build HTTP headers from a decrypted EndpointAuth.
- * Mirrors Go's endpointauth.ApplyAuth behaviour.
- */
-function buildAuthHeaders(auth: EndpointAuth): Record<string, string> {
-  const headers: Record<string, string> = {};
-  switch (auth.type) {
-    case AUTH_TYPE_BEARER:
-      if (auth.token) {
-        headers['Authorization'] = `Bearer ${auth.token}`;
-      }
-      break;
-    case AUTH_TYPE_API_KEY:
-      if (auth.keyName && auth.keyValue && auth.keyLocation === 'header') {
-        headers[auth.keyName] = auth.keyValue;
-      }
-      break;
-    case AUTH_TYPE_BASIC:
-      if (auth.username && auth.password) {
-        const encoded = Buffer.from(`${auth.username}:${auth.password}`).toString('base64');
-        headers['Authorization'] = `Basic ${encoded}`;
-      }
-      break;
-    case AUTH_TYPE_CUSTOM_HEADER:
-      if (auth.headerName && auth.headerValue) {
-        headers[auth.headerName] = auth.headerValue;
-      }
-      break;
-  }
-  return headers;
+  return (await readJsonBody<InvokeRequest>(c, { allowEmpty: true })) ?? {};
 }
 
 // ---------------------------------------------------------------------------
@@ -262,34 +171,14 @@ export function createInvokeHandlers(deps: InvokeDeps) {
   // getInvokeAmount — calculate required payment for a function invocation
   // -------------------------------------------------------------------
 
-  function getInvokeAmount(c: Context): bigint {
-    const rawName = c.req.param('function') ?? '';
-    if (!rawName) {
-      return pricingEngine.calculateInvocationCost(128, 1000);
-    }
-
-    const functionName = normalizeFunctionName(rawName);
-    if (!functionName) {
-      return pricingEngine.calculateInvocationCost(128, 1000);
-    }
-
-    // Check cache first
-    const cached = getCachedFunction(functionName);
-    if (cached) {
-      if (cached.custom_base_fee !== null && cached.custom_base_fee !== undefined) {
-        return BigInt(cached.custom_base_fee);
-      }
-      return pricingEngine.calculateInvocationCost(
-        cached.memory_mb,
-        cached.estimated_duration_ms,
-      );
-    }
-
-    // Note: We cannot do async DB lookups in a synchronous getAmount callback.
-    // The middleware calls getAmount synchronously. In the Go code this is also sync
-    // (it does a blocking DB call). For the TS port we rely on cached data or defaults.
-    // The handleInvoke handler does the full async DB lookup before invocation.
-    return pricingEngine.calculateInvocationCost(128, 1000);
+  async function getInvokeAmount(c: Context): Promise<bigint> {
+    const resolved = await resolveFunctionForRequest(
+      db,
+      config,
+      pricingEngine,
+      c.req.param('function') ?? '',
+    );
+    return resolved.amount;
   }
 
   // -------------------------------------------------------------------
@@ -314,59 +203,25 @@ export function createInvokeHandlers(deps: InvokeDeps) {
   // -------------------------------------------------------------------
 
   async function handleInvoke(c: Context): Promise<Response> {
-    // 1. Extract and validate function name
-    const rawName = c.req.param('function') ?? '';
-    if (!rawName) {
-      return c.json({ error: 'function name is required' }, 400);
-    }
-
-    const functionName = normalizeFunctionName(rawName);
-    if (!functionName) {
-      return c.json({
-        error: 'invalid function name',
-        message: 'Function names must contain only alphanumeric characters, hyphens, and underscores',
-      }, 400);
-    }
-
-    // 2. Look up function in DB (whitelist enforcement + endpoint type detection)
     let dbFunction: LambdaFunction | null = null;
+    let functionName = '';
+    let exactAmount = 0n;
 
-    if (db) {
-      // Check cache first
-      dbFunction = getCachedFunction(functionName);
-
-      if (!dbFunction) {
-        try {
-          dbFunction = await getFunction(db, functionName);
-          if (dbFunction) {
-            const ttl = config.functionCacheTTLSeconds > 0 ? config.functionCacheTTLSeconds : 60;
-            setCachedFunction(functionName, dbFunction, ttl);
-          }
-        } catch (err) {
-          log.error('database error looking up function', {
-            function: functionName,
-            error: err instanceof Error ? err.message : String(err),
-          });
-          return c.json({
-            error: 'service temporarily unavailable',
-            message: 'Unable to look up function. Please try again later.',
-          }, 503);
-        }
+    try {
+      const resolved = await resolveFunctionForRequest(
+        db,
+        config,
+        pricingEngine,
+        c.req.param('function') ?? '',
+      );
+      functionName = resolved.functionName;
+      dbFunction = resolved.dbFunction;
+      exactAmount = resolved.amount;
+    } catch (err) {
+      if (err instanceof HttpError) {
+        return jsonWithStatus(c, { error: err.message, details: err.details }, err.status);
       }
-
-      if (!dbFunction && config.enforceWhitelist) {
-        return c.json({
-          error: 'function not registered',
-          function: functionName,
-          message: 'This function is not available for invocation. Contact the administrator to register it.',
-        }, 403);
-      }
-    } else if (config.enforceWhitelist) {
-      return c.json({
-        error: 'function not registered',
-        function: functionName,
-        message: 'This function is not available for invocation. Contact the administrator to register it.',
-      }, 403);
+      throw err;
     }
 
     // 3. Get payment info from context
@@ -377,47 +232,41 @@ export function createInvokeHandlers(deps: InvokeDeps) {
     }
 
     // 4. Access control check for private functions
-    if (dbFunction && dbFunction.visibility === 'private') {
-      const payerAddr = paymentInfo.payer;
-      const isOwner = dbFunction.owner_address !== null &&
-        dbFunction.owner_address !== undefined &&
-        dbFunction.owner_address.toLowerCase() === payerAddr.toLowerCase();
-
-      if (!isOwner && db) {
-        try {
-          const accessRow = await db
-            .selectFrom('function_access_list')
-            .select('id')
-            .where('function_name', '=', functionName)
-            .where('invoker_address', '=', payerAddr.toLowerCase())
-            .executeTakeFirst();
-
-          if (!accessRow) {
-            return c.json({
-              error: 'access denied',
-              function: functionName,
-              message: 'This function is private. You are not authorized to invoke it.',
-            }, 403);
-          }
-        } catch (err) {
-          log.error('failed to check access authorization', {
-            function: functionName,
-            payer: payerAddr,
-            error: err instanceof Error ? err.message : String(err),
-          });
-          return c.json({ error: 'failed to verify access authorization' }, 500);
-        }
-      } else if (!isOwner) {
-        return c.json({
-          error: 'access denied',
+    try {
+      await assertFunctionInvocationAccess(
+        db,
+        functionName,
+        dbFunction,
+        paymentInfo.payer,
+      );
+    } catch (err) {
+      if (err instanceof HttpError) {
+        return jsonWithStatus(c, {
+          error: err.status === 403 ? 'access denied' : 'failed to verify access authorization',
           function: functionName,
-          message: 'This function is private. You are not authorized to invoke it.',
-        }, 403);
+          message: err.message,
+        }, err.status);
       }
+      throw err;
+    }
+
+    if (paymentInfo.amount !== exactAmount) {
+      return c.json({
+        error: 'payment amount mismatch',
+        message: 'Invocation payment amount no longer matches the exact function price.',
+      }, 400);
     }
 
     // 5. Parse request body
-    const req = await parseInvokeBody(c);
+    let req: InvokeRequest;
+    try {
+      req = await parseInvokeBody(c);
+    } catch (err) {
+      if (err instanceof HttpError) {
+        return jsonWithStatus(c, { error: err.message, details: err.details }, err.status);
+      }
+      throw err;
+    }
 
     // Validate refund address if provided
     let refundAddress = '';
@@ -470,12 +319,15 @@ export function createInvokeHandlers(deps: InvokeDeps) {
         }, 503);
       }
 
-      // Decrypt endpoint auth and build auth headers if configured
+      // Decrypt endpoint auth and apply it to the outbound request if configured
+      let endpointURL = dbFunction.function_arn;
       let endpointAuthHeaders: Record<string, string> | undefined;
       if (dbFunction.endpoint_auth_encrypted && config.endpointAuthKey) {
         try {
           const auth = decrypt(dbFunction.endpoint_auth_encrypted, config.endpointAuthKey);
-          endpointAuthHeaders = buildAuthHeaders(auth);
+          const applied = applyToRequest(auth, endpointURL);
+          endpointURL = applied.url;
+          endpointAuthHeaders = applied.headers;
         } catch (err) {
           log.error('failed to decrypt endpoint auth', {
             function: functionName,
@@ -486,7 +338,7 @@ export function createInvokeHandlers(deps: InvokeDeps) {
       }
 
       result = await lambdaInvoker.invokeHTTPEndpoint(
-        dbFunction.function_arn,
+        endpointURL,
         payload,
         timeoutSeconds,
         endpointAuthHeaders,

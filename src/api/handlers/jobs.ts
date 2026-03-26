@@ -14,20 +14,20 @@
 
 import type { Context } from 'hono';
 import type { Kysely } from 'kysely';
-import type { Selectable } from 'kysely';
-import type { Database, LambdaFunctionTable } from '../../db/types.js';
+import type { Database } from '../../db/types.js';
 import type { Config } from '../../config/index.js';
 import type { PricingEngine } from '../../pricing/engine.js';
 import { getPaymentInfo } from '../middleware/mpp.js';
-import { verifyAddressOwnership } from '../../auth/signature.js';
+import { verifyAddressOwnershipWithReplay } from '../../auth/signature.js';
 import { createAsyncJob, getAsyncJob, listAsyncJobsByAddress } from '../../db/store-jobs.js';
 import * as log from '../../logging/index.js';
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-type LambdaFunction = Selectable<LambdaFunctionTable>;
+import { HttpError } from '../errors.js';
+import { readJsonBody } from '../request-body.js';
+import { jsonWithStatus } from '../response.js';
+import {
+  assertFunctionInvocationAccess,
+  resolveFunctionForRequest,
+} from '../function-registry.js';
 
 export interface JobsDeps {
   db: Kysely<Database> | null;
@@ -40,47 +40,12 @@ interface SubmitJobRequest {
   ttlHours?: number;
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-const SAFE_FUNCTION_NAME_RE = /^[a-zA-Z0-9_-]{1,170}$/;
-
-function normalizeFunctionName(name: string): string {
-  const trimmed = name.trim();
-  if (!trimmed) return '';
-  if (!SAFE_FUNCTION_NAME_RE.test(trimmed)) return '';
-  return trimmed.toLowerCase();
-}
-
 function formatUSD(atomicAmount: bigint): string {
   const dollars = Number(atomicAmount) / 1_000_000;
   if (Math.abs(dollars) < 0.01) {
     return `$${dollars.toFixed(4)}`;
   }
   return `$${dollars.toFixed(2)}`;
-}
-
-// ---------------------------------------------------------------------------
-// Function cache
-// ---------------------------------------------------------------------------
-
-interface CachedFunction {
-  fn: LambdaFunction;
-  expiresAt: number;
-}
-
-const functionCache = new Map<string, CachedFunction>();
-
-function getCachedFunction(name: string): LambdaFunction | null {
-  const cached = functionCache.get(name);
-  if (cached && Date.now() < cached.expiresAt) {
-    return cached.fn;
-  }
-  if (cached) {
-    functionCache.delete(name);
-  }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +59,7 @@ function getCachedFunction(name: string): LambdaFunction | null {
  */
 async function requireAddressOwnership(
   c: Context,
+  db: Kysely<Database>,
 ): Promise<string | null> {
   // Support both header naming conventions:
   //   1. X-Wallet-Address / X-Wallet-Signature / X-Wallet-Message (Go convention)
@@ -111,12 +77,12 @@ async function requireAddressOwnership(
     return null;
   }
 
-  const result = await verifyAddressOwnership(signature, message, address);
+  const result = await verifyAddressOwnershipWithReplay(db, signature, message, address);
   if (!result.valid) {
-    c.res = c.json({
+    c.res = jsonWithStatus(c, {
       error: 'authentication failed',
       message: result.errorMessage,
-    }, 401) as unknown as Response;
+    }, result.statusCode ?? 401) as unknown as Response;
     return null;
   }
 
@@ -134,31 +100,15 @@ export function createJobsHandlers(deps: JobsDeps) {
   // getJobAmount
   // -------------------------------------------------------------------
 
-  function getJobAmount(c: Context): bigint {
-    // Job cost equals a single invocation cost (mirrors Go's GetJobAmount
-    // which delegates to GetInvokeAmount).
-    const rawName = c.req.param('function') ?? '';
-    if (!rawName) {
-      return pricingEngine.calculateInvocationCost(128, 1000);
-    }
-
-    const functionName = normalizeFunctionName(rawName);
-    if (!functionName) {
-      return pricingEngine.calculateInvocationCost(128, 1000);
-    }
-
-    const cached = getCachedFunction(functionName);
-    if (cached) {
-      if (cached.custom_base_fee !== null && cached.custom_base_fee !== undefined) {
-        return BigInt(cached.custom_base_fee);
-      }
-      return pricingEngine.calculateInvocationCost(
-        cached.memory_mb,
-        cached.estimated_duration_ms,
-      );
-    }
-
-    return pricingEngine.calculateInvocationCost(128, 1000);
+  async function getJobAmount(c: Context): Promise<bigint> {
+    const resolved = await resolveFunctionForRequest(
+      db,
+      config,
+      pricingEngine,
+      c.req.param('function') ?? '',
+      { requireRegistered: true },
+    );
+    return resolved.amount;
   }
 
   // -------------------------------------------------------------------
@@ -175,15 +125,25 @@ export function createJobsHandlers(deps: JobsDeps) {
   // -------------------------------------------------------------------
 
   async function handleSubmitJob(c: Context): Promise<Response> {
-    // 1. Validate function name
-    const rawName = c.req.param('function') ?? '';
-    if (!rawName) {
-      return c.json({ error: 'function name is required' }, 400);
-    }
-
-    const functionName = normalizeFunctionName(rawName);
-    if (!functionName) {
-      return c.json({ error: 'invalid function name' }, 400);
+    let functionName = '';
+    let dbFunction = null;
+    let amount = 0n;
+    try {
+      const resolved = await resolveFunctionForRequest(
+        db,
+        config,
+        pricingEngine,
+        c.req.param('function') ?? '',
+        { requireRegistered: true },
+      );
+      functionName = resolved.functionName;
+      dbFunction = resolved.dbFunction;
+      amount = resolved.amount;
+    } catch (err) {
+      if (err instanceof HttpError) {
+        return jsonWithStatus(c, { error: err.message, details: err.details }, err.status);
+      }
+      throw err;
     }
 
     // 2. Require payment info
@@ -197,14 +157,41 @@ export function createJobsHandlers(deps: JobsDeps) {
       return c.json({ error: 'database not configured' }, 503);
     }
 
-    // 4. Parse request body (tolerate empty body)
-    let req: SubmitJobRequest = {};
     try {
-      req = await c.req.json() as SubmitJobRequest;
-    } catch {
-      // Empty body or invalid JSON -- use defaults
+      await assertFunctionInvocationAccess(
+        db,
+        functionName,
+        dbFunction,
+        paymentInfo.payer,
+      );
+    } catch (err) {
+      if (err instanceof HttpError) {
+        return jsonWithStatus(c, {
+          error: err.status === 403 ? 'access denied' : 'failed to verify access authorization',
+          function: functionName,
+          message: err.message,
+        }, err.status);
+      }
+      throw err;
     }
 
+    if (paymentInfo.amount !== amount) {
+      return c.json({
+        error: 'payment amount mismatch',
+        message: 'Async job payment amount no longer matches the exact function price.',
+      }, 400);
+    }
+
+    // 4. Parse request body (tolerate empty body)
+    let req: SubmitJobRequest;
+    try {
+      req = (await readJsonBody<SubmitJobRequest>(c, { allowEmpty: true })) ?? {};
+    } catch (err) {
+      if (err instanceof HttpError) {
+        return jsonWithStatus(c, { error: err.message, details: err.details }, err.status);
+      }
+      throw err;
+    }
     const input = req.input ?? {};
 
     let ttlHours = req.ttlHours ?? 24;
@@ -277,7 +264,7 @@ export function createJobsHandlers(deps: JobsDeps) {
     }
 
     // Verify ownership
-    const verifiedAddr = await requireAddressOwnership(c);
+    const verifiedAddr = await requireAddressOwnership(c, db);
     if (!verifiedAddr) {
       return c.res;
     }
@@ -294,14 +281,13 @@ export function createJobsHandlers(deps: JobsDeps) {
   // -------------------------------------------------------------------
 
   async function handleListJobs(c: Context): Promise<Response> {
-    // Verify ownership first (like the Go handler)
-    const verifiedAddr = await requireAddressOwnership(c);
-    if (!verifiedAddr) {
-      return c.res;
-    }
-
     if (!db) {
       return c.json({ error: 'database not configured' }, 503);
+    }
+
+    const verifiedAddr = await requireAddressOwnership(c, db);
+    if (!verifiedAddr) {
+      return c.res;
     }
 
     let limit = 50;
