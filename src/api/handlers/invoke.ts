@@ -36,8 +36,7 @@ import * as metrics from '../../metrics/index.js';
 import type { OFACChecker } from '../../ofac/checker.js';
 import { applyToRequest, decrypt } from '../../endpoint-auth/index.js';
 import { readJsonBody } from '../request-body.js';
-import { HttpError } from '../errors.js';
-import { jsonWithStatus } from '../response.js';
+import { HttpError, errorResponse, ErrorCodes } from '../errors.js';
 import {
   assertFunctionInvocationAccess,
   invalidateFunctionCache,
@@ -219,7 +218,7 @@ export function createInvokeHandlers(deps: InvokeDeps) {
       exactAmount = resolved.amount;
     } catch (err) {
       if (err instanceof HttpError) {
-        return jsonWithStatus(c, { error: err.message, details: err.details }, err.status);
+        return errorResponse(c, err.status, ErrorCodes.INTERNAL_ERROR, err.message, err.details);
       }
       throw err;
     }
@@ -228,7 +227,7 @@ export function createInvokeHandlers(deps: InvokeDeps) {
     const paymentInfo = getPaymentInfo(c);
     if (!paymentInfo) {
       log.error('payment info missing in handler', { function: functionName });
-      return c.json({ error: 'payment info missing - payment middleware may not have run' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'payment info missing - payment middleware may not have run');
     }
 
     // 4. Access control check for private functions
@@ -241,20 +240,14 @@ export function createInvokeHandlers(deps: InvokeDeps) {
       );
     } catch (err) {
       if (err instanceof HttpError) {
-        return jsonWithStatus(c, {
-          error: err.status === 403 ? 'access denied' : 'failed to verify access authorization',
-          function: functionName,
-          message: err.message,
-        }, err.status);
+        const code = err.status === 403 ? ErrorCodes.FORBIDDEN : ErrorCodes.INTERNAL_ERROR;
+        return errorResponse(c, err.status, code, err.message, { function: functionName });
       }
       throw err;
     }
 
     if (paymentInfo.amount !== exactAmount) {
-      return c.json({
-        error: 'payment amount mismatch',
-        message: 'Invocation payment amount no longer matches the exact function price.',
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'Invocation payment amount no longer matches the exact function price.');
     }
 
     // 5. Parse request body
@@ -263,7 +256,7 @@ export function createInvokeHandlers(deps: InvokeDeps) {
       req = await parseInvokeBody(c);
     } catch (err) {
       if (err instanceof HttpError) {
-        return jsonWithStatus(c, { error: err.message, details: err.details }, err.status);
+        return errorResponse(c, err.status, ErrorCodes.INTERNAL_ERROR, err.message, err.details);
       }
       throw err;
     }
@@ -277,16 +270,10 @@ export function createInvokeHandlers(deps: InvokeDeps) {
         if (ofacChecker && ofacChecker.isBlocked(refundAddress)) {
           metrics.ofacBlockedTotal.inc({ endpoint: c.req.path });
           log.warn('OFAC blocked address rejected (refund)', { payer: refundAddress });
-          return c.json({
-            error: 'address_blocked',
-            message: 'This address is not permitted to use this service',
-          }, 403);
+          return errorResponse(c, 403, ErrorCodes.FORBIDDEN, 'This address is not permitted to use this service');
         }
       } catch (err) {
-        return c.json({
-          error: 'invalid refund address',
-          message: err instanceof Error ? err.message : String(err),
-        }, 400);
+        return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : String(err));
       }
     }
 

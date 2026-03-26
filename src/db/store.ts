@@ -1,6 +1,9 @@
-import { Kysely, sql } from "kysely";
+import { type Kysely, type Transaction, sql } from "kysely";
 
 import type { Database } from "./types.js";
+
+/** Accepts both Kysely instances and Kysely transactions. */
+type KyselyExecutor<DB> = Kysely<DB> | Transaction<DB>;
 
 /**
  * Store wraps a Kysely<Database> instance and provides transactional helpers.
@@ -10,9 +13,9 @@ import type { Database } from "./types.js";
  * they work identically inside or outside a transaction.
  */
 export class Store {
-  readonly db: Kysely<Database>;
+  readonly db: KyselyExecutor<Database>;
 
-  constructor(db: Kysely<Database>) {
+  constructor(db: KyselyExecutor<Database>) {
     this.db = db;
   }
 
@@ -36,7 +39,7 @@ export class Store {
     fn: (txStore: Store) => Promise<T>,
   ): Promise<T> {
     return this.db.transaction().execute(async (trx) => {
-      const txStore = new Store(trx as unknown as Kysely<Database>);
+      const txStore = new Store(trx);
       return fn(txStore);
     });
   }

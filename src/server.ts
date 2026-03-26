@@ -43,6 +43,7 @@ import {
   WebhookBandwidthNotifier,
 } from './lease/bandwidth-worker.js';
 import { PriceCalculator } from './aws-pricing/calculator.js';
+import { PriceFetcher } from './aws-pricing/fetcher.js';
 import { LeaseService, type LeaseServiceConfig } from './lease/service.js';
 import { Store } from './db/store.js';
 import { AsyncJobWorker } from './jobs/worker.js';
@@ -227,6 +228,7 @@ interface Workers {
   bandwidthWorker?: BandwidthWorker;
   asyncJobWorker?: AsyncJobWorker;
   backgroundWorkers?: BackgroundWorkers;
+  priceSyncAbort?: AbortController;
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +330,17 @@ export function createApp(deps: ServerDeps): { app: Hono; workers: Workers; bill
       cfg.leasePriceMaxAgeHours * 60 * 60 * 1000,
     );
 
+    // AWS Pricing API sync — populates the aws_pricing table periodically
+    // so that PriceCalculator.getCachedPrice() returns real data instead
+    // of falling back to static pricing.
+    const priceFetcher = new PriceFetcher(db, cfg.awsRegion);
+    const priceSyncAbort = new AbortController();
+    priceFetcher.runSync(
+      cfg.leasePricingSyncHours * 60 * 60 * 1000,
+      priceSyncAbort.signal,
+    );
+    workers.priceSyncAbort = priceSyncAbort;
+
     // Lease service for lease lifecycle management
     const leaseServiceConfig: LeaseServiceConfig = {
       maxPerUser: cfg.leaseMaxPerUser,
@@ -399,6 +412,7 @@ export function createApp(deps: ServerDeps): { app: Hono; workers: Workers; bill
     const backgroundWorkers = new BackgroundWorkers({
       db,
       billingService,
+      refundService: billingService.getRefundService(),
       config: cfg,
     });
     backgroundWorkers.start();
@@ -481,6 +495,7 @@ export function startServer(
       opts.workers.bandwidthWorker?.stop();
       opts.workers.asyncJobWorker?.stop();
       opts.workers.backgroundWorkers?.stop();
+      opts.workers.priceSyncAbort?.abort();
       logger.info('Workers stopped');
     }
 

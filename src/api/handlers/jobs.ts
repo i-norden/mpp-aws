@@ -21,9 +21,8 @@ import { getPaymentInfo } from '../middleware/mpp.js';
 import { verifyAddressOwnershipWithReplay } from '../../auth/signature.js';
 import { createAsyncJob, getAsyncJob, listAsyncJobsByAddress } from '../../db/store-jobs.js';
 import * as log from '../../logging/index.js';
-import { HttpError } from '../errors.js';
+import { HttpError, errorResponse, ErrorCodes } from '../errors.js';
 import { readJsonBody } from '../request-body.js';
-import { jsonWithStatus } from '../response.js';
 import {
   assertFunctionInvocationAccess,
   resolveFunctionForRequest,
@@ -69,20 +68,13 @@ async function requireAddressOwnership(
   const message = c.req.header('X-Wallet-Message') ?? c.req.header('X-Message') ?? '';
 
   if (!address || !signature || !message) {
-    c.res = c.json({
-      error: 'authentication required',
-      message: 'X-Wallet-Address, X-Wallet-Signature, and X-Wallet-Message headers are required',
-      hint: "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet",
-    }, 401);
+    c.res = errorResponse(c, 401, ErrorCodes.AUTHENTICATION_REQUIRED, 'X-Wallet-Address, X-Wallet-Signature, and X-Wallet-Message headers are required', "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet");
     return null;
   }
 
   const result = await verifyAddressOwnershipWithReplay(db, signature, message, address);
   if (!result.valid) {
-    c.res = jsonWithStatus(c, {
-      error: 'authentication failed',
-      message: result.errorMessage,
-    }, result.statusCode ?? 401);
+    c.res = errorResponse(c, result.statusCode ?? 401, ErrorCodes.AUTHENTICATION_FAILED, result.errorMessage ?? 'authentication failed');
     return null;
   }
 
@@ -141,7 +133,7 @@ export function createJobsHandlers(deps: JobsDeps) {
       amount = resolved.amount;
     } catch (err) {
       if (err instanceof HttpError) {
-        return jsonWithStatus(c, { error: err.message, details: err.details }, err.status);
+        return errorResponse(c, err.status, ErrorCodes.INVALID_REQUEST, err.message, err.details);
       }
       throw err;
     }
@@ -149,12 +141,12 @@ export function createJobsHandlers(deps: JobsDeps) {
     // 2. Require payment info
     const paymentInfo = getPaymentInfo(c);
     if (!paymentInfo) {
-      return c.json({ error: 'payment info missing' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'payment info missing');
     }
 
     // 3. Require database
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     try {
@@ -166,20 +158,14 @@ export function createJobsHandlers(deps: JobsDeps) {
       );
     } catch (err) {
       if (err instanceof HttpError) {
-        return jsonWithStatus(c, {
-          error: err.status === 403 ? 'access denied' : 'failed to verify access authorization',
-          function: functionName,
-          message: err.message,
-        }, err.status);
+        const code = err.status === 403 ? ErrorCodes.FORBIDDEN : ErrorCodes.INTERNAL_ERROR;
+        return errorResponse(c, err.status, code, err.status === 403 ? 'access denied' : 'failed to verify access authorization', { function: functionName, detail: err.message });
       }
       throw err;
     }
 
     if (paymentInfo.amount !== amount) {
-      return c.json({
-        error: 'payment amount mismatch',
-        message: 'Async job payment amount no longer matches the exact function price.',
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'Async job payment amount no longer matches the exact function price.');
     }
 
     // 4. Parse request body (tolerate empty body)
@@ -188,7 +174,7 @@ export function createJobsHandlers(deps: JobsDeps) {
       req = (await readJsonBody<SubmitJobRequest>(c, { allowEmpty: true })) ?? {};
     } catch (err) {
       if (err instanceof HttpError) {
-        return jsonWithStatus(c, { error: err.message, details: err.details }, err.status);
+        return errorResponse(c, err.status, ErrorCodes.INVALID_REQUEST, err.message, err.details);
       }
       throw err;
     }
@@ -229,7 +215,7 @@ export function createJobsHandlers(deps: JobsDeps) {
         payer: paymentInfo.payer,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to create job' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to create job');
     }
   }
 
@@ -240,11 +226,11 @@ export function createJobsHandlers(deps: JobsDeps) {
   async function handleGetJob(c: Context): Promise<Response> {
     const jobId = c.req.param('jobId') ?? '';
     if (!jobId) {
-      return c.json({ error: 'job ID is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'job ID is required');
     }
 
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     // Retrieve the job
@@ -256,11 +242,11 @@ export function createJobsHandlers(deps: JobsDeps) {
         jobId,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to retrieve job' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to retrieve job');
     }
 
     if (!job) {
-      return c.json({ error: 'job not found' }, 404);
+      return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'job not found');
     }
 
     // Verify ownership
@@ -270,7 +256,7 @@ export function createJobsHandlers(deps: JobsDeps) {
     }
 
     if (verifiedAddr !== job.payer_address) {
-      return c.json({ error: 'you do not own this job' }, 403);
+      return errorResponse(c, 403, ErrorCodes.FORBIDDEN, 'you do not own this job');
     }
 
     return c.json(job, 200);
@@ -282,7 +268,7 @@ export function createJobsHandlers(deps: JobsDeps) {
 
   async function handleListJobs(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const verifiedAddr = await requireAddressOwnership(c, db);
@@ -310,7 +296,7 @@ export function createJobsHandlers(deps: JobsDeps) {
         payer: verifiedAddr,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list jobs' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list jobs');
     }
   }
 

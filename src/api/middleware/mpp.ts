@@ -18,8 +18,7 @@ import type { OFACChecker } from '../../ofac/checker.js';
 import { validateEthAddress } from '../../validation/index.js';
 import * as log from '../../logging/index.js';
 import * as metrics from '../../metrics/index.js';
-import { HttpError } from '../errors.js';
-import { jsonWithStatus } from '../response.js';
+import { HttpError, errorResponse, ErrorCodes } from '../errors.js';
 
 // ---------------------------------------------------------------------------
 // Store interface (optional dependency for nonce tracking & budgets)
@@ -132,7 +131,7 @@ function setPaymentRequiredResponse(
     );
   } catch (err) {
     log.error('failed to create payment challenge', { error: String(err) });
-    return c.json({ error: 'internal error preparing payment requirements' }, 500);
+    return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'internal error preparing payment requirements');
   }
 }
 
@@ -251,11 +250,7 @@ export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
         description = await getDescription(c);
       } catch (err) {
         if (err instanceof HttpError) {
-          const body: Record<string, unknown> = { error: err.message };
-          if (err.details !== undefined) {
-            body.details = err.details;
-          }
-          return jsonWithStatus(c, body, err.status);
+          return errorResponse(c, err.status, ErrorCodes.INVALID_REQUEST, err.message, err.details);
         }
 
         log.error('failed to resolve payment requirements', {

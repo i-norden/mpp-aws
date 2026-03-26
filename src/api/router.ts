@@ -56,6 +56,9 @@ import { createAdminHandlers } from './handlers/admin.js';
 // Metrics (for /metrics endpoint)
 import { register } from '../metrics/index.js';
 
+// OpenAPI specification
+import { buildOpenAPISpec } from './openapi.js';
+
 // ---------------------------------------------------------------------------
 // Lease / EC2 types (optional dependencies)
 // ---------------------------------------------------------------------------
@@ -93,36 +96,7 @@ export interface RouterDeps {
 // ---------------------------------------------------------------------------
 
 function openAPISpec(cfg: Config): object {
-  return {
-    openapi: '3.0.3',
-    info: {
-      title: 'MMP AWS Compute Marketplace',
-      description: 'MPP-powered AWS Lambda & EC2 compute marketplace',
-      version: '0.1.0',
-    },
-    servers: cfg.publicURL
-      ? [{ url: cfg.publicURL }]
-      : [{ url: `http://localhost:${cfg.port}` }],
-    paths: {
-      '/health': { get: { summary: 'Health check', tags: ['Health'] } },
-      '/health/live': { get: { summary: 'Liveness probe', tags: ['Health'] } },
-      '/health/ready': { get: { summary: 'Readiness probe', tags: ['Health'] } },
-      '/pricing': { get: { summary: 'Get pricing information', tags: ['Public'] } },
-      '/functions': { get: { summary: 'List available functions', tags: ['Public'] } },
-      '/functions/search': { get: { summary: 'Search functions', tags: ['Public'] } },
-      '/functions/{name}/analytics': { get: { summary: 'Function analytics', tags: ['Public'] } },
-      '/invoke/{function}': { post: { summary: 'Invoke a function (payment required)', tags: ['Invoke'] } },
-      '/invoke/{function}/batch': { post: { summary: 'Batch invoke (payment required)', tags: ['Invoke'] } },
-      '/credits/{address}': { get: { summary: 'Get credit balance', tags: ['Credits'] } },
-      '/credits/{address}/history': { get: { summary: 'Credit history', tags: ['Credits'] } },
-      '/credits/{address}/redeem': { post: { summary: 'Redeem credits', tags: ['Credits'] } },
-      '/earnings/{address}': { get: { summary: 'Get earnings balance', tags: ['Earnings'] } },
-      '/earnings/{address}/history': { get: { summary: 'Earnings history', tags: ['Earnings'] } },
-      '/earnings/{address}/functions': { get: { summary: 'Earnings by function', tags: ['Earnings'] } },
-      '/earnings/{address}/withdraw': { post: { summary: 'Withdraw earnings', tags: ['Earnings'] } },
-      '/metrics': { get: { summary: 'Prometheus metrics', tags: ['Monitoring'] } },
-    },
-  };
+  return buildOpenAPISpec(cfg);
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +465,15 @@ export function createRouter(deps: RouterDeps): Hono {
     app.post('/admin/gdpr/delete', adminRateLimit, adminAuth, adminHandlers.handleAdminGDPRDelete);
     app.get('/admin/monitoring/table-sizes', adminRateLimit, adminAuth, adminHandlers.handleAdminTableSizes);
     app.post('/admin/retention/run', adminRateLimit, adminAuth, adminHandlers.handleAdminRunRetention);
+
+    // Voucher management
+    app.post('/admin/vouchers', adminRateLimit, adminAuth, adminHandlers.handleAdminCreateVoucher);
+    app.get('/admin/vouchers', adminRateLimit, adminAuth, adminHandlers.handleAdminListVouchers);
+    app.delete('/admin/vouchers/:voucherId', adminRateLimit, adminAuth, adminHandlers.handleAdminRevokeVoucher);
+
+    // Refund monitoring
+    app.get('/admin/refunds/monitoring', adminRateLimit, adminAuth, adminHandlers.handleAdminRefundMonitoring);
+    app.get('/admin/refunds/history', adminRateLimit, adminAuth, adminHandlers.handleAdminRefundHistory);
   }
 
   return app;

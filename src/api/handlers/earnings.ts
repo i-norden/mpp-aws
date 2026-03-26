@@ -26,7 +26,7 @@ import {
   getEarningsByFunction,
 } from '../../db/store-earnings.js';
 import * as log from '../../logging/index.js';
-import { jsonWithStatus } from '../response.js';
+import { errorResponse, ErrorCodes } from '../errors.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -67,20 +67,13 @@ async function verifyOwnership(
   const message = c.req.header('X-Message') ?? '';
 
   if (!signature || !message) {
-    c.res = c.json({
-      error: 'authentication required',
-      message: 'X-Signature and X-Message headers are required to access earnings information',
-      hint: "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet",
-    }, 401);
+    c.res = errorResponse(c, 401, ErrorCodes.AUTHENTICATION_REQUIRED, 'X-Signature and X-Message headers are required to access earnings information', "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet");
     return false;
   }
 
   const result = await verifyAddressOwnershipWithReplay(db, signature, message, address);
   if (!result.valid) {
-    c.res = jsonWithStatus(c, {
-      error: 'authentication failed',
-      message: result.errorMessage,
-    }, result.statusCode ?? 401);
+    c.res = errorResponse(c, result.statusCode ?? 401, ErrorCodes.AUTHENTICATION_FAILED, result.errorMessage ?? 'authentication failed');
     return false;
   }
 
@@ -100,17 +93,17 @@ export function createEarningsHandlers(deps: EarningsDeps) {
 
   async function handleGetEarnings(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const rawAddress = c.req.param('address') ?? '';
     if (!rawAddress) {
-      return c.json({ error: 'address is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'address is required');
     }
     try {
       validateEthAddress(rawAddress, 'address');
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : String(err));
     }
 
     const address = rawAddress.toLowerCase();
@@ -135,7 +128,7 @@ export function createEarningsHandlers(deps: EarningsDeps) {
         payer: address,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to get earnings balance' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get earnings balance');
     }
   }
 
@@ -145,17 +138,17 @@ export function createEarningsHandlers(deps: EarningsDeps) {
 
   async function handleListEarnings(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const rawAddress = c.req.param('address') ?? '';
     if (!rawAddress) {
-      return c.json({ error: 'address is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'address is required');
     }
     try {
       validateEthAddress(rawAddress, 'address');
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : String(err));
     }
 
     const address = rawAddress.toLowerCase();
@@ -212,7 +205,7 @@ export function createEarningsHandlers(deps: EarningsDeps) {
         payer: address,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to list earnings' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to list earnings');
     }
   }
 
@@ -222,17 +215,17 @@ export function createEarningsHandlers(deps: EarningsDeps) {
 
   async function handleGetEarningsByFunction(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     const rawAddress = c.req.param('address') ?? '';
     if (!rawAddress) {
-      return c.json({ error: 'address is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'address is required');
     }
     try {
       validateEthAddress(rawAddress, 'address');
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : String(err));
     }
 
     const address = rawAddress.toLowerCase();
@@ -263,7 +256,7 @@ export function createEarningsHandlers(deps: EarningsDeps) {
         payer: address,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to get earnings by function' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get earnings by function');
     }
   }
 
@@ -273,31 +266,28 @@ export function createEarningsHandlers(deps: EarningsDeps) {
 
   async function handleWithdrawEarnings(c: Context): Promise<Response> {
     if (!db) {
-      return c.json({ error: 'database not configured' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
     }
 
     if (!config.refundEnabled) {
-      return c.json({ error: 'withdrawals not enabled' }, 503);
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'withdrawals not enabled');
     }
 
     const rawAddress = c.req.param('address') ?? '';
     if (!rawAddress) {
-      return c.json({ error: 'address is required' }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'address is required');
     }
     try {
       validateEthAddress(rawAddress, 'address');
     } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, err instanceof Error ? err.message : String(err));
     }
 
     const address = rawAddress.toLowerCase();
 
     // OFAC check on earnings withdrawal address
     if (ofacChecker && ofacChecker.isBlocked(address)) {
-      return c.json({
-        error: 'address_blocked',
-        message: 'This address is not permitted to use this service',
-      }, 403);
+      return errorResponse(c, 403, ErrorCodes.ADDRESS_BLOCKED, 'This address is not permitted to use this service');
     }
 
     if (!(await verifyOwnership(c, db, address))) {
@@ -313,35 +303,29 @@ export function createEarningsHandlers(deps: EarningsDeps) {
         payer: address,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({ error: 'failed to get earnings balance' }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to get earnings balance');
     }
 
     if (balance.availableBalance <= 0n) {
-      return c.json({
-        error: 'no earnings available',
-        availableBalance: 0n,
-      }, 400);
+      return errorResponse(c, 400, ErrorCodes.INSUFFICIENT_BALANCE, 'no earnings available');
     }
 
     // Check minimum threshold
     if (balance.availableBalance < config.minEarningsWithdrawal) {
-      return c.json({
-        error: 'earnings balance below minimum withdrawal threshold',
+      return errorResponse(c, 400, ErrorCodes.INSUFFICIENT_BALANCE, 'earnings balance below minimum withdrawal threshold', {
         availableBalance: balance.availableBalance,
         availableUSD: formatUSD(balance.availableBalance),
         minimumRequired: config.minEarningsWithdrawal,
         minimumUSD: formatUSD(config.minEarningsWithdrawal),
-      }, 400);
+      });
     }
 
     // Check if billing service is available
     if (!billingService || !billingService.isRefundEnabled()) {
-      return c.json({
-        error: 'withdrawal_unavailable',
+      return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'Withdrawal service is not configured.', {
         availableBalance: balance.availableBalance,
         availableUSD: formatUSD(balance.availableBalance),
-        message: 'Withdrawal service is not configured.',
-      }, 503);
+      });
     }
 
     // Process the withdrawal via billing service
@@ -353,19 +337,14 @@ export function createEarningsHandlers(deps: EarningsDeps) {
         payer: address,
         error: err instanceof Error ? err.message : String(err),
       });
-      return c.json({
-        error: 'withdrawal_failed',
-        message: 'Failed to process earnings withdrawal',
-      }, 500);
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'Failed to process earnings withdrawal');
     }
 
     if (!result.success) {
-      return c.json({
-        error: 'withdrawal_failed',
-        message: result.error,
+      return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, result.error ?? 'withdrawal failed', {
         availableBalance: result.availableBalance ?? 0n,
         availableUSD: formatUSD(result.availableBalance ?? 0n),
-      }, 400);
+      });
     }
 
     return c.json({

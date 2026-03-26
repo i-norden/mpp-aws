@@ -215,7 +215,9 @@ describe('API middleware', () => {
     });
 
     expect(response.status).toBe(409);
-    await expect(response.json()).resolves.toEqual({ error: 'resource unavailable' });
+    const body = await response.json() as Record<string, unknown>;
+    expect(body.error).toBe('invalid_request');
+    expect(body.message).toBe('resource unavailable');
   });
 
   it('returns 200 with Payment-Receipt when mppx verifies successfully', async () => {

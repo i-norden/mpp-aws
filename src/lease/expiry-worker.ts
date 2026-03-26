@@ -165,7 +165,7 @@ export class ExpiryWorker {
         .where('expires_at', '<=', warningCutoff)
         .where('expires_at', '>', new Date())
         .execute();
-      leases = rows as unknown as LeaseRow[];
+      leases = rows;
     } catch (err) {
       log.error('failed to list expiring leases for warnings', {
         error: err instanceof Error ? err.message : String(err),
@@ -209,7 +209,7 @@ export class ExpiryWorker {
         .where('status', 'in', ['running', 'provisioning'])
         .where('expires_at', '<=', new Date())
         .execute();
-      leases = rows as unknown as LeaseRow[];
+      leases = rows;
     } catch (err) {
       log.error('failed to list expired leases', {
         error: err instanceof Error ? err.message : String(err),
@@ -307,7 +307,7 @@ export class SGCleanupWorker {
         .where('status', 'in', ['terminated', 'failed'])
         .where('security_group_id', 'is not', null)
         .execute();
-      leases = rows as unknown as LeaseRow[];
+      leases = rows;
     } catch (err) {
       log.error('failed to list leases with orphaned SGs', {
         error: err instanceof Error ? err.message : String(err),
