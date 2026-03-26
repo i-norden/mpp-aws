@@ -28,7 +28,6 @@ export interface Config {
   databaseURL: string;
 
   // MPP Configuration
-  facilitatorURL: string;
   network: string;
   payToAddress: string;
   usdcAddress: string;
@@ -264,7 +263,6 @@ export function loadConfig(): Config {
     databaseURL: getEnvOrEmpty('DATABASE_URL'),
 
     // MPP Configuration
-    facilitatorURL: getEnv('FACILITATOR_URL', 'https://facilitator.example.com'),
     network,
     payToAddress: getEnvOrEmpty('PAY_TO_ADDRESS'),
     usdcAddress: getEnv('USDC_ADDRESS', '0x036CbD53842c5426634e7929541eC2318f3dCF7e'),
@@ -495,13 +493,6 @@ export interface ProductionSafetyResult {
 export function validateProductionSafety(cfg: Config): ProductionSafetyResult {
   const warnings: string[] = [];
   const isMainnet = cfg.network === 'base';
-
-  // Hard error: FACILITATOR_URL contains "testnet" on mainnet
-  if (isMainnet && cfg.facilitatorURL.toLowerCase().includes('testnet')) {
-    throw new ConfigValidationError(
-      "FACILITATOR_URL contains 'testnet' but NETWORK=base (mainnet) — use your production MPP settlement endpoint",
-    );
-  }
 
   // Hard error: RPC_URL contains "sepolia" on mainnet
   if (isMainnet && cfg.rpcURL.toLowerCase().includes('sepolia')) {
