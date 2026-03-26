@@ -202,9 +202,10 @@ export class LeaseService {
   async getPriceForResource(
     resourceId: string,
     durationDays: number,
+    options?: { allowDisabled?: boolean },
   ): Promise<bigint> {
     const resource = await getLeaseResource(this.store.db, resourceId);
-    if (!resource || !resource.enabled) {
+    if (!resource || (!resource.enabled && !options?.allowDisabled)) {
       throw new Error(`resource not found or disabled: ${resourceId}`);
     }
     const price = priceForDuration(resource, durationDays);
@@ -224,9 +225,10 @@ export class LeaseService {
     resourceId: string,
     durationDays: number,
     addOns: LeaseAddOns,
+    options?: { allowDisabled?: boolean },
   ): Promise<{ breakdown: PriceBreakdown; totalAtomic: bigint }> {
     const resource = await getLeaseResource(this.store.db, resourceId);
-    if (!resource || !resource.enabled) {
+    if (!resource || (!resource.enabled && !options?.allowDisabled)) {
       throw new Error(`resource not found or disabled: ${resourceId}`);
     }
 
@@ -262,6 +264,49 @@ export class LeaseService {
       isFallback: true,
     };
     return { breakdown, totalAtomic: staticPrice };
+  }
+
+  /**
+   * Computes the exact renewal price for an existing running lease using the
+   * lease's persisted add-ons rather than request-time guesses.
+   */
+  async getRenewalPrice(
+    resourceId: string,
+    leaseId: string,
+    durationDays: number,
+  ): Promise<{ breakdown: PriceBreakdown; totalAtomic: bigint }> {
+    if (!VALID_DURATIONS.has(durationDays)) {
+      throw new Error(
+        `unsupported duration: ${durationDays} (must be 1, 7, or 30)`,
+      );
+    }
+
+    const lease = await dbGetLease(this.store.db, leaseId);
+    if (!lease) {
+      throw new Error(`lease not found: ${leaseId}`);
+    }
+    if (lease.resource_id !== resourceId) {
+      throw new Error(`lease not found: ${leaseId}`);
+    }
+    if (lease.status !== LeaseStatus.Running) {
+      throw new Error(`lease is not running (status: ${lease.status})`);
+    }
+
+    const resource = await getLeaseResource(this.store.db, lease.resource_id);
+    if (!resource) {
+      throw new Error(`resource not found or disabled: ${lease.resource_id}`);
+    }
+
+    return this.getPriceForLease(
+      resourceId,
+      durationDays,
+      {
+        storageGB: lease.storage_gb ?? resource.default_storage_gb,
+        publicIP: lease.has_public_ip,
+        loadBalancer: lease.has_load_balancer,
+      },
+      { allowDisabled: true },
+    );
   }
 
   // -----------------------------------------------------------------------
@@ -306,6 +351,14 @@ export class LeaseService {
       // Determine storage
       const storageGB =
         params.storageGB > 0 ? params.storageGB : resource.default_storage_gb;
+      if (
+        storageGB < resource.min_storage_gb
+        || storageGB > resource.max_storage_gb
+      ) {
+        throw new Error(
+          `storageGB must be between ${resource.min_storage_gb} and ${resource.max_storage_gb}`,
+        );
+      }
 
       // Create lease record
       const leaseId = uuidv4();
@@ -334,7 +387,7 @@ export class LeaseService {
         price_breakdown: params.priceBreakdown
           ? JSON.parse(
               JSON.stringify(params.priceBreakdown, (_key, value) =>
-                typeof value === 'bigint' ? Number(value) : value,
+                typeof value === 'bigint' ? value.toString() : value,
               ),
             )
           : null,

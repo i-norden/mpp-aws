@@ -18,7 +18,7 @@ import type { Database } from '../../db/types.js';
 import type { Config } from '../../config/index.js';
 import type { BillingService } from '../../billing/service.js';
 import type { OFACChecker } from '../../ofac/checker.js';
-import { verifyAddressOwnership } from '../../auth/signature.js';
+import { verifyAddressOwnershipWithReplay } from '../../auth/signature.js';
 import { validateEthAddress } from '../../validation/index.js';
 import {
   getEarningsBalance,
@@ -26,6 +26,7 @@ import {
   getEarningsByFunction,
 } from '../../db/store-earnings.js';
 import * as log from '../../logging/index.js';
+import { jsonWithStatus } from '../response.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -59,6 +60,7 @@ function formatUSD(atomicAmount: bigint): string {
  */
 async function verifyOwnership(
   c: Context,
+  db: Kysely<Database>,
   address: string,
 ): Promise<boolean> {
   const signature = c.req.header('X-Signature') ?? '';
@@ -73,12 +75,12 @@ async function verifyOwnership(
     return false;
   }
 
-  const result = await verifyAddressOwnership(signature, message, address);
+  const result = await verifyAddressOwnershipWithReplay(db, signature, message, address);
   if (!result.valid) {
-    c.res = c.json({
+    c.res = jsonWithStatus(c, {
       error: 'authentication failed',
       message: result.errorMessage,
-    }, 401) as unknown as Response;
+    }, result.statusCode ?? 401) as unknown as Response;
     return false;
   }
 
@@ -113,7 +115,7 @@ export function createEarningsHandlers(deps: EarningsDeps) {
 
     const address = rawAddress.toLowerCase();
 
-    if (!(await verifyOwnership(c, address))) {
+    if (!(await verifyOwnership(c, db, address))) {
       return c.res;
     }
 
@@ -122,10 +124,10 @@ export function createEarningsHandlers(deps: EarningsDeps) {
 
       return c.json({
         address,
-        availableBalance: Number(balance.availableBalance),
+        availableBalance: balance.availableBalance,
         availableUSD: formatUSD(balance.availableBalance),
-        totalEarned: Number(balance.totalEarned),
-        totalWithdrawn: Number(balance.totalWithdrawn),
+        totalEarned: balance.totalEarned,
+        totalWithdrawn: balance.totalWithdrawn,
         earningCount: balance.earningCount,
       });
     } catch (err) {
@@ -158,7 +160,7 @@ export function createEarningsHandlers(deps: EarningsDeps) {
 
     const address = rawAddress.toLowerCase();
 
-    if (!(await verifyOwnership(c, address))) {
+    if (!(await verifyOwnership(c, db, address))) {
       return c.res;
     }
 
@@ -170,7 +172,7 @@ export function createEarningsHandlers(deps: EarningsDeps) {
       interface EarningEntry {
         id: number;
         functionName: string;
-        amount: number;
+        amount: bigint;
         amountUSD: string;
         sourceTxHash?: string;
         withdrawn: boolean;
@@ -183,7 +185,7 @@ export function createEarningsHandlers(deps: EarningsDeps) {
         const entry: EarningEntry = {
           id: Number(e.id),
           functionName: e.function_name,
-          amount: Number(e.amount),
+          amount: BigInt(e.amount),
           amountUSD: formatUSD(BigInt(e.amount)),
           withdrawn: e.withdrawal_status !== 'available',
           createdAt: new Date(e.created_at).toISOString(),
@@ -235,7 +237,7 @@ export function createEarningsHandlers(deps: EarningsDeps) {
 
     const address = rawAddress.toLowerCase();
 
-    if (!(await verifyOwnership(c, address))) {
+    if (!(await verifyOwnership(c, db, address))) {
       return c.res;
     }
 
@@ -244,9 +246,9 @@ export function createEarningsHandlers(deps: EarningsDeps) {
 
       const entries = results.map((r) => ({
         functionName: r.functionName,
-        totalEarned: Number(r.totalEarned),
+        totalEarned: r.totalEarned,
         totalEarnedUSD: formatUSD(r.totalEarned),
-        availableBalance: Number(r.availableBalance),
+        availableBalance: r.availableBalance,
         availableUSD: formatUSD(r.availableBalance),
         invocationCount: r.invocationCount,
       }));
@@ -298,7 +300,7 @@ export function createEarningsHandlers(deps: EarningsDeps) {
       }, 403);
     }
 
-    if (!(await verifyOwnership(c, address))) {
+    if (!(await verifyOwnership(c, db, address))) {
       return c.res;
     }
 
@@ -317,7 +319,7 @@ export function createEarningsHandlers(deps: EarningsDeps) {
     if (balance.availableBalance <= 0n) {
       return c.json({
         error: 'no earnings available',
-        availableBalance: 0,
+        availableBalance: 0n,
       }, 400);
     }
 
@@ -325,9 +327,9 @@ export function createEarningsHandlers(deps: EarningsDeps) {
     if (balance.availableBalance < config.minEarningsWithdrawal) {
       return c.json({
         error: 'earnings balance below minimum withdrawal threshold',
-        availableBalance: Number(balance.availableBalance),
+        availableBalance: balance.availableBalance,
         availableUSD: formatUSD(balance.availableBalance),
-        minimumRequired: Number(config.minEarningsWithdrawal),
+        minimumRequired: config.minEarningsWithdrawal,
         minimumUSD: formatUSD(config.minEarningsWithdrawal),
       }, 400);
     }
@@ -336,7 +338,7 @@ export function createEarningsHandlers(deps: EarningsDeps) {
     if (!billingService || !billingService.isRefundEnabled()) {
       return c.json({
         error: 'withdrawal_unavailable',
-        availableBalance: Number(balance.availableBalance),
+        availableBalance: balance.availableBalance,
         availableUSD: formatUSD(balance.availableBalance),
         message: 'Withdrawal service is not configured.',
       }, 503);
@@ -361,21 +363,21 @@ export function createEarningsHandlers(deps: EarningsDeps) {
       return c.json({
         error: 'withdrawal_failed',
         message: result.error,
-        availableBalance: Number(result.availableBalance ?? 0n),
+        availableBalance: result.availableBalance ?? 0n,
         availableUSD: formatUSD(result.availableBalance ?? 0n),
       }, 400);
     }
 
     return c.json({
       success: true,
-      amountWithdrawn: Number(result.amountWithdrawn ?? 0n),
+      amountWithdrawn: result.amountWithdrawn ?? 0n,
       amountWithdrawnUSD: formatUSD(result.amountWithdrawn ?? 0n),
-      amountSent: Number(result.amountSent ?? 0n),
+      amountSent: result.amountSent ?? 0n,
       amountSentUSD: formatUSD(result.amountSent ?? 0n),
-      gasCost: Number(result.gasCost ?? 0n),
+      gasCost: result.gasCost ?? 0n,
       gasCostUSD: formatUSD(result.gasCost ?? 0n),
       txHash: result.txHash,
-      remainingBalance: Number(result.availableBalance ?? 0n),
+      remainingBalance: result.availableBalance ?? 0n,
     });
   }
 

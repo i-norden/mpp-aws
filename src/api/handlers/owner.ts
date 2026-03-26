@@ -24,7 +24,7 @@ import type { Database, LambdaFunctionTable } from '../../db/types.js';
 import type { Config } from '../../config/index.js';
 import type { PricingEngine } from '../../pricing/engine.js';
 import type { OFACChecker } from '../../ofac/checker.js';
-import { verifyAddressOwnership } from '../../auth/signature.js';
+import { verifyAddressOwnershipWithReplay } from '../../auth/signature.js';
 import { validateEthAddress } from '../../validation/index.js';
 import {
   getAccessList,
@@ -38,6 +38,7 @@ import {
   type EndpointAuth,
 } from '../../endpoint-auth/index.js';
 import * as log from '../../logging/index.js';
+import { jsonWithStatus } from '../response.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -113,6 +114,7 @@ function formatUSD(atomicAmount: bigint): string {
  */
 async function verifyOwnership(
   c: Context,
+  db: Kysely<Database>,
   address: string,
 ): Promise<boolean> {
   const signature = c.req.header('X-Signature') ?? '';
@@ -127,12 +129,12 @@ async function verifyOwnership(
     return false;
   }
 
-  const result = await verifyAddressOwnership(signature, message, address);
+  const result = await verifyAddressOwnershipWithReplay(db, signature, message, address);
   if (!result.valid) {
-    c.res = c.json({
+    c.res = jsonWithStatus(c, {
       error: 'authentication failed',
       message: result.errorMessage,
-    }, 401) as unknown as Response;
+    }, result.statusCode ?? 401) as unknown as Response;
     return false;
   }
 
@@ -181,7 +183,7 @@ async function verifyFunctionOwnership(
     return null;
   }
 
-  if (!(await verifyOwnership(c, fn.owner_address))) {
+  if (!(await verifyOwnership(c, db, fn.owner_address))) {
     return null;
   }
 
@@ -711,7 +713,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
     }
 
     // Verify caller is the new owner
-    if (!(await verifyOwnership(c, transfer.new_owner))) {
+    if (!(await verifyOwnership(c, db, transfer.new_owner))) {
       return c.res;
     }
 
@@ -826,7 +828,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
     }
 
     // Verify caller is owner
-    if (!(await verifyOwnership(c, fn.owner_address))) {
+    if (!(await verifyOwnership(c, db, fn.owner_address))) {
       return c.res;
     }
 
@@ -944,7 +946,7 @@ export function createOwnerHandlers(deps: OwnerDeps) {
     }
 
     // Verify caller is owner
-    if (!(await verifyOwnership(c, fn.owner_address))) {
+    if (!(await verifyOwnership(c, db, fn.owner_address))) {
       return c.res;
     }
 

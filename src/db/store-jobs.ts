@@ -89,36 +89,58 @@ export async function listAsyncJobsByAddress(
 }
 
 /**
- * List pending async jobs waiting to be processed, ordered by creation time.
+ * Atomically claim the next pending async jobs that have not expired.
+ *
+ * Uses `FOR UPDATE SKIP LOCKED` inside a single UPDATE statement so multiple
+ * workers/processes can safely poll the same table without double-running jobs.
  */
-export async function listPendingAsyncJobs(
+export async function claimPendingAsyncJobs(
   db: Kysely<Database>,
   limit: number,
 ): Promise<AsyncJob[]> {
-  return db
-    .selectFrom('async_jobs')
-    .selectAll()
-    .where('status', '=', 'pending')
-    .orderBy('created_at', 'asc')
-    .limit(limit)
-    .execute();
+  if (limit <= 0) {
+    return [];
+  }
+
+  const result = await sql<AsyncJob>`
+    WITH claimable AS (
+      SELECT id
+      FROM async_jobs
+      WHERE status = 'pending'
+        AND expires_at > NOW()
+      ORDER BY created_at ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT ${limit}
+    )
+    UPDATE async_jobs AS jobs
+    SET status = 'running',
+        started_at = NOW()
+    FROM claimable
+    WHERE jobs.id = claimable.id
+    RETURNING jobs.*
+  `.execute(db);
+
+  return result.rows;
 }
 
 /**
- * Mark an async job as running.
+ * Mark expired pending async jobs as failed so they can be surfaced and later cleaned up.
  */
-export async function updateAsyncJobRunning(
+export async function expirePendingAsyncJobs(
   db: Kysely<Database>,
-  jobId: string,
-): Promise<void> {
-  await db
+): Promise<number> {
+  const result = await db
     .updateTable('async_jobs')
     .set({
-      status: 'running',
-      started_at: sql`NOW()`,
+      status: 'failed',
+      error_message: 'job expired before execution',
+      completed_at: sql`NOW()`,
     })
-    .where('id', '=', jobId)
-    .execute();
+    .where('status', '=', 'pending')
+    .where('expires_at', '<=', sql<Date>`NOW()`)
+    .executeTakeFirst();
+
+  return Number(result.numUpdatedRows ?? 0);
 }
 
 /**

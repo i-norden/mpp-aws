@@ -13,22 +13,18 @@ import type { Config } from '../config/index.js';
 import type { LambdaInvoker, InvocationResult } from '../lambda/invoker.js';
 import type { BillingService, InvocationBilling } from '../billing/service.js';
 import {
-  listPendingAsyncJobs,
-  updateAsyncJobRunning,
+  claimPendingAsyncJobs,
   updateAsyncJobCompleted,
   updateAsyncJobFailed,
+  expirePendingAsyncJobs,
   deleteExpiredAsyncJobs,
   type AsyncJob,
 } from '../db/store-jobs.js';
 import { getFunction } from '../db/store-functions.js';
 import { createInvocation } from '../db/store-invocations.js';
 import {
+  applyToRequest,
   decrypt,
-  type EndpointAuth,
-  AUTH_TYPE_BEARER,
-  AUTH_TYPE_API_KEY,
-  AUTH_TYPE_BASIC,
-  AUTH_TYPE_CUSTOM_HEADER,
 } from '../endpoint-auth/index.js';
 import * as log from '../logging/index.js';
 
@@ -50,35 +46,6 @@ export interface AsyncJobWorkerDeps {
 /** Check if a function ARN is an HTTPS endpoint URL. */
 function isHTTPEndpoint(arn: string): boolean {
   return arn.startsWith('https://');
-}
-
-/** Build HTTP headers from a decrypted EndpointAuth. */
-function buildAuthHeaders(auth: EndpointAuth): Record<string, string> {
-  const headers: Record<string, string> = {};
-  switch (auth.type) {
-    case AUTH_TYPE_BEARER:
-      if (auth.token) {
-        headers['Authorization'] = `Bearer ${auth.token}`;
-      }
-      break;
-    case AUTH_TYPE_API_KEY:
-      if (auth.keyName && auth.keyValue && auth.keyLocation === 'header') {
-        headers[auth.keyName] = auth.keyValue;
-      }
-      break;
-    case AUTH_TYPE_BASIC:
-      if (auth.username && auth.password) {
-        const encoded = Buffer.from(`${auth.username}:${auth.password}`).toString('base64');
-        headers['Authorization'] = `Basic ${encoded}`;
-      }
-      break;
-    case AUTH_TYPE_CUSTOM_HEADER:
-      if (auth.headerName && auth.headerValue) {
-        headers[auth.headerName] = auth.headerValue;
-      }
-      break;
-  }
-  return headers;
 }
 
 // ---------------------------------------------------------------------------
@@ -162,9 +129,9 @@ export class AsyncJobWorker {
   private async processPending(): Promise<void> {
     let jobs: AsyncJob[];
     try {
-      jobs = await listPendingAsyncJobs(this.db, this.maxConcurrent);
+      jobs = await claimPendingAsyncJobs(this.db, this.maxConcurrent);
     } catch (err) {
-      log.error('failed to list pending async jobs', {
+      log.error('failed to claim pending async jobs', {
         error: err instanceof Error ? err.message : String(err),
       });
       return;
@@ -186,18 +153,7 @@ export class AsyncJobWorker {
   private async processJob(job: AsyncJob): Promise<void> {
     const jobId = String(job.id);
 
-    // 1. Mark as running
-    try {
-      await updateAsyncJobRunning(this.db, jobId);
-    } catch (err) {
-      log.error('failed to mark async job as running', {
-        jobId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return;
-    }
-
-    // 2. Look up the function in the database
+    // 1. Look up the function in the database
     let dbFunction;
     try {
       dbFunction = await getFunction(this.db, job.function_name);
@@ -215,16 +171,19 @@ export class AsyncJobWorker {
       return;
     }
 
-    // 3. Invoke Lambda or HTTP endpoint
+    // 2. Invoke Lambda or HTTP endpoint
     let result: InvocationResult;
     try {
       if (isHTTPEndpoint(dbFunction.function_arn)) {
         // Build auth headers if configured
+        let endpointURL = dbFunction.function_arn;
         let authHeaders: Record<string, string> | undefined;
         if (dbFunction.endpoint_auth_encrypted && this.config.endpointAuthKey) {
           try {
             const auth = decrypt(dbFunction.endpoint_auth_encrypted, this.config.endpointAuthKey);
-            authHeaders = buildAuthHeaders(auth);
+            const applied = applyToRequest(auth, endpointURL);
+            endpointURL = applied.url;
+            authHeaders = applied.headers;
           } catch (err) {
             log.error('failed to decrypt endpoint auth for async job', {
               jobId,
@@ -236,7 +195,7 @@ export class AsyncJobWorker {
         }
 
         result = await this.lambdaInvoker.invokeHTTPEndpoint(
-          dbFunction.function_arn,
+          endpointURL,
           job.input,
           dbFunction.timeout_seconds,
           authHeaders,
@@ -251,7 +210,7 @@ export class AsyncJobWorker {
       return;
     }
 
-    // 4. Handle invocation result
+    // 3. Handle invocation result
     if (!result.success) {
       const errMsg = result.error || 'invocation returned non-success status';
       log.warn('async job invocation failed', {
@@ -264,7 +223,7 @@ export class AsyncJobWorker {
       return;
     }
 
-    // 5. Process billing (if billing service and duration data are available)
+    // 4. Process billing (if billing service and duration data are available)
     let actualCost = 0n;
     if (this.billingService && !isHTTPEndpoint(dbFunction.function_arn) && result.billedDurationMs > 0) {
       try {
@@ -293,7 +252,7 @@ export class AsyncJobWorker {
       }
     }
 
-    // 6. Log the invocation
+    // 5. Log the invocation
     try {
       await createInvocation(this.db, {
         function_name: job.function_name,
@@ -316,7 +275,7 @@ export class AsyncJobWorker {
       // Continue -- logging failure should not fail the job
     }
 
-    // 7. Mark as completed
+    // 6. Mark as completed
     let resultPayload: unknown;
     try {
       resultPayload = result.body ? JSON.parse(result.body) : null;
@@ -361,6 +320,13 @@ export class AsyncJobWorker {
 
   private async cleanupExpired(): Promise<void> {
     try {
+      const expiredPending = await expirePendingAsyncJobs(this.db);
+      if (expiredPending > 0) {
+        log.info('marked expired pending async jobs as failed', {
+          count: expiredPending,
+        });
+      }
+
       const count = await deleteExpiredAsyncJobs(this.db);
       if (count > 0) {
         log.info('cleaned up expired async jobs', { count });
