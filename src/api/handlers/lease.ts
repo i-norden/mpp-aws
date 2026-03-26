@@ -1,28 +1,27 @@
 /**
  * Lease API handlers.
- * TypeScript port of mmp-compute/lambda-proxy/internal/api/handlers_lease.go
  *
- * Provides endpoints for:
- *  - Listing available lease resources
- *  - Getting lease price
- *  - Creating a new lease (with encrypted SSH key delivery)
- *  - Polling lease status
- *  - Renewing a running lease
+ * Keeps HTTP concerns in this module and delegates lease lifecycle logic to
+ * LeaseService so pricing, creation, status, and renewal follow one path.
  */
 
 import type { Context } from 'hono';
 import type { Kysely, Selectable } from 'kysely';
-import type { Database, LeaseResourceTable } from '../../db/types.js';
-import type { Config } from '../../config/index.js';
-import { getPaymentInfo } from '../middleware/mpp.js';
-import { verifyAddressOwnership } from '../../auth/signature.js';
-import { generateED25519KeyPair, zeroBytes } from '../../ssh-crypto/keygen.js';
-import { encryptPrivateKey } from '../../ssh-crypto/encrypt.js';
-import * as log from '../../logging/index.js';
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+import { verifyAddressOwnershipWithReplay } from '../../auth/signature.js';
+import type { LeaseAddOns } from '../../aws-pricing/types.js';
+import type { Config } from '../../config/index.js';
+import type { Database, LeaseResourceTable } from '../../db/types.js';
+import {
+  GlobalLimitReachedError,
+  ResourceLimitReachedError,
+  UserLimitReachedError,
+} from '../../db/store-lease.js';
+import { HttpError } from '../errors.js';
+import { getPaymentInfo } from '../middleware/mpp.js';
+import { readJsonBody } from '../request-body.js';
+import { jsonWithStatus } from '../response.js';
+import * as log from '../../logging/index.js';
 
 type LeaseResource = Selectable<LeaseResourceTable>;
 
@@ -65,61 +64,53 @@ interface ResourceResponse {
 }
 
 interface CreateLeaseRequest {
-  publicKey: string; // base64-encoded X25519 public key
+  publicKey?: string;
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 const VALID_DURATIONS = new Set([1, 7, 30]);
 
-function parseDuration(s: string | undefined): { days: number; error?: string } {
-  if (!s) return { days: 0, error: 'duration is required' };
-  const days = parseInt(s, 10);
-  if (Number.isNaN(days)) return { days: 0, error: `invalid duration: ${s}` };
-  if (!VALID_DURATIONS.has(days)) {
-    return { days: 0, error: `unsupported duration: ${days} (must be 1, 7, or 30)` };
+function parseDuration(raw: string | undefined): number {
+  if (!raw) {
+    throw new HttpError(400, 'duration is required');
   }
-  return { days };
+
+  const days = parseInt(raw, 10);
+  if (Number.isNaN(days) || !VALID_DURATIONS.has(days)) {
+    throw new HttpError(400, 'duration must be one of 1, 7, or 30 days');
+  }
+
+  return days;
 }
 
 function formatUSD(atomicAmount: bigint): string {
   const dollars = Number(atomicAmount) / 1_000_000;
-  if (Math.abs(dollars) < 0.01) return `$${dollars.toFixed(4)}`;
+  if (Math.abs(dollars) < 0.01) {
+    return `$${dollars.toFixed(4)}`;
+  }
   return `$${dollars.toFixed(2)}`;
 }
 
-function priceForDuration(resource: LeaseResource, days: number): bigint {
-  switch (days) {
-    case 1: return resource.price_1d;
-    case 7: return resource.price_7d;
-    case 30: return resource.price_30d;
-    default: return 0n;
-  }
-}
-
-function formatResourcePricing(r: LeaseResource): Record<string, ResourcePricing> {
+function formatResourcePricing(resource: LeaseResource): Record<string, ResourcePricing> {
   return {
-    '1': { atomicUsdc: r.price_1d, usd: formatUSD(r.price_1d) },
-    '7': { atomicUsdc: r.price_7d, usd: formatUSD(r.price_7d) },
-    '30': { atomicUsdc: r.price_30d, usd: formatUSD(r.price_30d) },
+    '1': { atomicUsdc: resource.price_1d, usd: formatUSD(resource.price_1d) },
+    '7': { atomicUsdc: resource.price_7d, usd: formatUSD(resource.price_7d) },
+    '30': { atomicUsdc: resource.price_30d, usd: formatUSD(resource.price_30d) },
   };
 }
 
-function resourceAddOns(r: LeaseResource): AddOn[] {
+function resourceAddOns(resource: LeaseResource): AddOn[] {
   return [
     {
       name: 'Extra Storage',
       queryParam: 'storageGb',
       type: 'int',
-      default: r.default_storage_gb,
+      default: resource.default_storage_gb,
     },
     {
       name: 'Public IP',
       queryParam: 'publicIp',
       type: 'bool',
-      default: r.public_ip_default,
+      default: resource.public_ip_default,
     },
     {
       name: 'Load Balancer',
@@ -130,83 +121,193 @@ function resourceAddOns(r: LeaseResource): AddOn[] {
   ];
 }
 
-function formatTimeRemaining(ms: number): string {
-  if (ms <= 0) return 'expired';
-  const totalHours = Math.floor(ms / (1000 * 60 * 60));
-  const days = Math.floor(totalHours / 24);
-  const hours = totalHours % 24;
-  if (days > 0) return `${days}d ${hours}h`;
-  const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
-  return `${hours}h ${minutes}m`;
+function parseBooleanQuery(
+  raw: string | undefined,
+  defaultValue: boolean,
+  fieldName: string,
+): boolean {
+  if (raw === undefined) {
+    return defaultValue;
+  }
+
+  if (raw === 'true' || raw === '1') {
+    return true;
+  }
+  if (raw === 'false' || raw === '0') {
+    return false;
+  }
+
+  throw new HttpError(400, `${fieldName} must be true, false, 1, or 0`);
 }
 
-/**
- * Verify wallet ownership via signature headers.
- * Returns the verified payer address or null (with error response already sent).
- */
+function parseLeaseAddOns(resource: LeaseResource, c: Context): LeaseAddOns {
+  let storageGB = resource.default_storage_gb;
+  const storageParam = c.req.query('storageGb');
+  if (storageParam !== undefined) {
+    const parsed = parseInt(storageParam, 10);
+    if (Number.isNaN(parsed)) {
+      throw new HttpError(400, 'storageGb must be an integer');
+    }
+    if (parsed < resource.min_storage_gb || parsed > resource.max_storage_gb) {
+      throw new HttpError(
+        400,
+        `storageGb must be between ${resource.min_storage_gb} and ${resource.max_storage_gb}`,
+      );
+    }
+    storageGB = parsed;
+  }
+
+  return {
+    storageGB,
+    publicIP: parseBooleanQuery(c.req.query('publicIp'), resource.public_ip_default, 'publicIp'),
+    loadBalancer: parseBooleanQuery(c.req.query('loadBalancer'), false, 'loadBalancer'),
+  };
+}
+
+function leaseErrorToHttpError(error: unknown): HttpError {
+  if (error instanceof HttpError) {
+    return error;
+  }
+
+  if (
+    error instanceof ResourceLimitReachedError
+    || error instanceof UserLimitReachedError
+    || error instanceof GlobalLimitReachedError
+  ) {
+    return new HttpError(409, error.message);
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith('resource not found') || message.startsWith('lease not found')) {
+    return new HttpError(404, message);
+  }
+  if (message.startsWith('unauthorized')) {
+    return new HttpError(403, message);
+  }
+  if (message.includes('not running') || message.includes('maximum')) {
+    return new HttpError(409, message);
+  }
+  if (
+    message.includes('invalid public key')
+    || message.includes('unsupported duration')
+    || message.includes('storage')
+  ) {
+    return new HttpError(400, message);
+  }
+
+  return new HttpError(500, 'lease operation failed', message);
+}
+
 async function requireAddressOwnership(
   c: Context,
+  db: Kysely<Database>,
 ): Promise<string | null> {
   const address = c.req.header('X-Wallet-Address') ?? '';
-  const signature = c.req.header('X-Wallet-Signature') ?? '';
-  const message = c.req.header('X-Wallet-Message') ?? '';
+  const signature = c.req.header('X-Wallet-Signature') ?? c.req.header('X-Signature') ?? '';
+  const message = c.req.header('X-Wallet-Message') ?? c.req.header('X-Message') ?? '';
 
   if (!address || !signature || !message) {
-    c.status(401);
+    c.res = c.json({
+      error: 'authentication required',
+      message: 'X-Wallet-Address, X-Wallet-Signature, and X-Wallet-Message headers are required',
+      hint: "Sign a message in format 'open-compute:{address}:{timestamp}:{nonce}' with your wallet",
+    }, 401) as unknown as Response;
     return null;
   }
 
-  const result = await verifyAddressOwnership(signature, message, address.toLowerCase());
+  const result = await verifyAddressOwnershipWithReplay(
+    db,
+    signature,
+    message,
+    address,
+  );
   if (!result.valid) {
-    c.status(401);
+    c.res = jsonWithStatus(c, {
+      error: 'authentication failed',
+      message: result.errorMessage,
+    }, result.statusCode ?? 401) as unknown as Response;
     return null;
   }
 
   return result.address;
 }
 
-// ---------------------------------------------------------------------------
-// createLeaseHandlers
-// ---------------------------------------------------------------------------
-
 export function createLeaseHandlers(deps: LeaseDeps) {
-  const { db, config } = deps;
+  const { db, config, leaseService } = deps;
 
-  // -------------------------------------------------------------------
-  // listResources: GET /lease/resources
-  // -------------------------------------------------------------------
+  function getLeaseService() {
+    if (!leaseService) {
+      throw new HttpError(503, 'lease service not configured');
+    }
+    return leaseService;
+  }
+
+  async function quoteLeaseRequest(c: Context) {
+    const service = getLeaseService();
+    const resourceId = c.req.param('resourceId') ?? '';
+    if (!resourceId) {
+      throw new HttpError(400, 'resource ID is required');
+    }
+
+    const days = parseDuration(c.req.query('duration'));
+    const resource = await service.getResource(resourceId);
+    if (!resource || !resource.enabled) {
+      throw new HttpError(404, `resource not found: ${resourceId}`);
+    }
+
+    const addOns = parseLeaseAddOns(resource, c);
+    try {
+      const quote = await service.getPriceForLease(resourceId, days, addOns);
+      return { resourceId, days, resource, addOns, quote };
+    } catch (error) {
+      throw leaseErrorToHttpError(error);
+    }
+  }
+
+  async function quoteRenewalRequest(c: Context) {
+    const service = getLeaseService();
+    const resourceId = c.req.param('resourceId') ?? '';
+    const leaseId = c.req.param('leaseId') ?? '';
+    if (!resourceId || !leaseId) {
+      throw new HttpError(400, 'resource ID and lease ID are required');
+    }
+
+    const days = parseDuration(c.req.query('duration'));
+    try {
+      const quote = await service.getRenewalPrice(resourceId, leaseId, days);
+      return { resourceId, leaseId, days, quote };
+    } catch (error) {
+      throw leaseErrorToHttpError(error);
+    }
+  }
 
   async function listResources(c: Context): Promise<Response> {
     let resources: LeaseResource[];
     try {
-      resources = await db
-        .selectFrom('lease_resources')
-        .selectAll()
-        .where('enabled', '=', true)
-        .execute();
-    } catch (err) {
+      resources = await getLeaseService().listResources() as LeaseResource[];
+    } catch (error) {
       log.error('failed to list lease resources', {
-        error: err instanceof Error ? err.message : String(err),
+        error: error instanceof Error ? error.message : String(error),
       });
       return c.json({ error: 'failed to list resources' }, 500);
     }
 
-    const items: ResourceResponse[] = resources.map((r) => ({
-      id: r.id,
-      name: r.display_name,
-      instanceType: r.instance_type,
-      vcpus: r.vcpus,
-      memoryGB: r.memory_gb,
-      storageGB: r.storage_gb,
-      description: r.description,
-      pricing: formatResourcePricing(r),
-      defaultStorageGb: r.default_storage_gb,
-      minStorageGb: r.min_storage_gb,
-      maxStorageGb: r.max_storage_gb,
-      egressLimitGb: r.egress_limit_gb,
-      ingressLimitGb: r.ingress_limit_gb,
-      publicIpDefault: r.public_ip_default,
-      addOns: resourceAddOns(r),
+    const items: ResourceResponse[] = resources.map((resource) => ({
+      id: resource.id,
+      name: resource.display_name,
+      instanceType: resource.instance_type,
+      vcpus: resource.vcpus,
+      memoryGB: resource.memory_gb,
+      storageGB: resource.storage_gb,
+      description: resource.description,
+      pricing: formatResourcePricing(resource),
+      defaultStorageGb: resource.default_storage_gb,
+      minStorageGb: resource.min_storage_gb,
+      maxStorageGb: resource.max_storage_gb,
+      egressLimitGb: resource.egress_limit_gb,
+      ingressLimitGb: resource.ingress_limit_gb,
+      publicIpDefault: resource.public_ip_default,
+      addOns: resourceAddOns(resource),
     }));
 
     return c.json({
@@ -216,62 +317,46 @@ export function createLeaseHandlers(deps: LeaseDeps) {
     });
   }
 
-  // -------------------------------------------------------------------
-  // getLeaseAmount: calculate the payment amount for a lease
-  // (used as the getAmount callback for payment middleware)
-  // -------------------------------------------------------------------
-
-  function getLeaseAmount(_c: Context): bigint {
-    // Synchronous approximation: we cannot do async DB lookups here.
-    // The actual price validation happens in the createLease handler.
-    // Return -1 to signal the middleware that price cannot be determined
-    // from a sync callback. A more robust implementation would pre-cache
-    // resource prices keyed by resourceId and duration.
-    return -1n;
+  async function getLeaseAmount(c: Context): Promise<bigint> {
+    const { quote } = await quoteLeaseRequest(c);
+    return quote.totalAtomic;
   }
-
-  // -------------------------------------------------------------------
-  // getLeaseDescription: description for payment middleware
-  // -------------------------------------------------------------------
 
   function getLeaseDescription(c: Context): string {
     const resourceId = c.req.param('resourceId') ?? '';
     const duration = c.req.query('duration') ?? '';
-    let desc = `EC2 lease: ${resourceId} for ${duration} days`;
+    let description = `EC2 lease: ${resourceId} for ${duration} days`;
 
     const storageGb = c.req.query('storageGb');
-    if (storageGb) desc += `, ${storageGb}GB storage`;
-
-    const publicIp = c.req.query('publicIp');
-    if (publicIp === 'false' || publicIp === '0') desc += ', no public IP';
-
-    const loadBalancer = c.req.query('loadBalancer');
-    if (loadBalancer === 'true' || loadBalancer === '1') desc += ', with load balancer';
-
-    return desc;
-  }
-
-  // -------------------------------------------------------------------
-  // createLease: POST /lease/:resourceId?duration=N
-  // -------------------------------------------------------------------
-
-  async function createLease(c: Context): Promise<Response> {
-    const resourceId = c.req.param('resourceId') ?? '';
-    const durationStr = c.req.query('duration');
-    const { days, error: durationError } = parseDuration(durationStr);
-    if (durationError) {
-      return c.json({ error: 'invalid_duration', message: durationError }, 400);
+    if (storageGb) {
+      description += `, ${storageGb}GB storage`;
     }
 
-    // Parse request body
+    const publicIp = c.req.query('publicIp');
+    if (publicIp === 'false' || publicIp === '0') {
+      description += ', no public IP';
+    }
+
+    const loadBalancer = c.req.query('loadBalancer');
+    if (loadBalancer === 'true' || loadBalancer === '1') {
+      description += ', with load balancer';
+    }
+
+    return description;
+  }
+
+  async function createLease(c: Context): Promise<Response> {
     let body: CreateLeaseRequest;
+    let quoted: Awaited<ReturnType<typeof quoteLeaseRequest>>;
+
     try {
-      body = await c.req.json<CreateLeaseRequest>();
-    } catch {
-      return c.json({
-        error: 'invalid_request',
-        message: 'Request body must contain a base64-encoded X25519 publicKey',
-      }, 400);
+      body = await readJsonBody<CreateLeaseRequest>(c);
+      quoted = await quoteLeaseRequest(c);
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return jsonWithStatus(c, { error: error.message, details: error.details }, error.status);
+      }
+      throw error;
     }
 
     if (!body.publicKey) {
@@ -281,314 +366,88 @@ export function createLeaseHandlers(deps: LeaseDeps) {
       }, 400);
     }
 
-    // Get payment info from context (set by payment middleware)
     const paymentInfo = getPaymentInfo(c);
     if (!paymentInfo) {
       return c.json({ error: 'payment info missing' }, 500);
     }
 
-    // Validate resource
-    let resource: LeaseResource | undefined;
+    if (paymentInfo.amount !== quoted.quote.totalAtomic) {
+      return c.json({
+        error: 'payment amount mismatch',
+        message: 'Lease payment amount no longer matches the exact quoted price.',
+      }, 400);
+    }
+
     try {
-      resource = await db
-        .selectFrom('lease_resources')
-        .selectAll()
-        .where('id', '=', resourceId)
-        .where('enabled', '=', true)
-        .executeTakeFirst();
-    } catch (err) {
-      log.error('failed to get resource', {
-        error: err instanceof Error ? err.message : String(err),
+      const created = await getLeaseService().createLease({
+        resourceId: quoted.resourceId,
+        durationDays: quoted.days,
+        payerAddress: paymentInfo.payer,
+        txHash: paymentInfo.txHash,
+        amountPaid: paymentInfo.amount,
+        userPublicKeyBase64: body.publicKey,
+        storageGB: quoted.addOns.storageGB,
+        publicIP: quoted.addOns.publicIP,
+        loadBalancer: quoted.addOns.loadBalancer,
+        priceBreakdown: quoted.quote.breakdown,
       });
-      return c.json({ error: 'failed to get resource' }, 500);
-    }
 
-    if (!resource) {
       return c.json({
-        error: 'resource_not_found',
-        message: `Resource not found: ${resourceId}`,
-      }, 400);
-    }
-
-    // Decode user's X25519 public key
-    let userPubKeyBytes: Uint8Array;
-    try {
-      userPubKeyBytes = new Uint8Array(Buffer.from(body.publicKey, 'base64'));
-    } catch {
-      return c.json({
-        error: 'invalid_public_key',
-        message: 'publicKey must be valid base64',
-      }, 400);
-    }
-    if (userPubKeyBytes.length !== 32) {
-      return c.json({
-        error: 'invalid_public_key',
-        message: `Invalid public key length: expected 32 bytes, got ${userPubKeyBytes.length}`,
-      }, 400);
-    }
-
-    // Generate SSH key pair
-    const keyPair = generateED25519KeyPair();
-
-    // Encrypt private key with user's public key
-    let encrypted;
-    try {
-      encrypted = encryptPrivateKey(keyPair.privateKey, userPubKeyBytes);
-    } catch (err) {
-      return c.json({
-        error: 'encryption_failed',
-        message: err instanceof Error ? err.message : 'failed to encrypt SSH key',
-      }, 500);
-    } finally {
-      zeroBytes(keyPair.privateKey);
-    }
-
-    // Determine storage and IP settings
-    const storageGbParam = c.req.query('storageGb');
-    let storageGb = resource.default_storage_gb;
-    if (storageGbParam) {
-      const parsed = parseInt(storageGbParam, 10);
-      if (!Number.isNaN(parsed) && parsed >= resource.min_storage_gb && parsed <= resource.max_storage_gb) {
-        storageGb = parsed;
-      }
-    }
-
-    const publicIpParam = c.req.query('publicIp');
-    const hasPublicIp = publicIpParam === 'false' || publicIpParam === '0'
-      ? false
-      : resource.public_ip_default;
-
-    const loadBalancerParam = c.req.query('loadBalancer');
-    const hasLoadBalancer = loadBalancerParam === 'true' || loadBalancerParam === '1';
-
-    // Create lease record
-    const leaseId = crypto.randomUUID();
-    const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
-
-    // Compute static price breakdown
-    const price = priceForDuration(resource, days);
-    const priceBreakdown = {
-      totalAtomic: price.toString(),
-      totalUsd: Number(price) / 1_000_000,
-      isFallback: true,
-    };
-
-    // Check concurrent limits and insert atomically
-    try {
-      await db.transaction().execute(async (trx) => {
-        // Check per-resource concurrent limit
-        const { count: resourceCount } = await trx
-          .selectFrom('leases')
-          .select((eb) => eb.fn.countAll<number>().as('count'))
-          .where('resource_id', '=', resourceId)
-          .where('status', 'in', ['pending', 'provisioning', 'running'])
-          .executeTakeFirstOrThrow();
-
-        if (resource!.max_concurrent > 0 && Number(resourceCount) >= resource!.max_concurrent) {
-          throw new Error('resource at maximum concurrent lease capacity');
-        }
-
-        // Check per-user limit
-        const { count: userCount } = await trx
-          .selectFrom('leases')
-          .select((eb) => eb.fn.countAll<number>().as('count'))
-          .where('payer_address', '=', paymentInfo.payer)
-          .where('status', 'in', ['pending', 'provisioning', 'running'])
-          .executeTakeFirstOrThrow();
-
-        if (config.leaseMaxPerUser > 0 && Number(userCount) >= config.leaseMaxPerUser) {
-          throw new Error('maximum active leases per user reached');
-        }
-
-        // Check global limit
-        if (config.leaseMaxGlobalActive > 0) {
-          const { count: globalCount } = await trx
-            .selectFrom('leases')
-            .select((eb) => eb.fn.countAll<number>().as('count'))
-            .where('status', 'in', ['pending', 'provisioning', 'running'])
-            .executeTakeFirstOrThrow();
-
-          if (Number(globalCount) >= config.leaseMaxGlobalActive) {
-            throw new Error('global active lease limit reached');
-          }
-        }
-
-        // Insert the lease
-        await trx
-          .insertInto('leases')
-          .values({
-            id: leaseId,
-            resource_id: resourceId,
-            payer_address: paymentInfo.payer,
-            amount_paid: paymentInfo.amount,
-            payment_tx_hash: paymentInfo.txHash,
-            duration_days: days,
-            ssh_public_key: keyPair.publicKey.trim(),
-            encrypted_private_key: encrypted.combined,
-            user_public_key: Buffer.from(userPubKeyBytes).toString('hex'),
-            encryption_nonce: encrypted.nonce,
-            status: 'pending',
-            expires_at: expiresAt.toISOString(),
-            storage_gb: storageGb,
-            has_public_ip: hasPublicIp,
-            has_load_balancer: hasLoadBalancer,
-            egress_limit_gb: resource!.egress_limit_gb,
-            ingress_limit_gb: resource!.ingress_limit_gb,
-            price_breakdown: JSON.stringify(priceBreakdown),
-          })
-          .execute();
+        leaseId: created.leaseId,
+        resourceId: created.resourceId,
+        status: created.status,
+        expiresAt: created.expiresAt.toISOString(),
+        encryptedSshKey: created.encryptedSSHKey,
+        sshPublicKey: created.sshPublicKey,
+        paymentTxHash: created.paymentTxHash,
+        statusUrl: `/lease/${created.resourceId}/${created.leaseId}/status`,
+        storageGb: created.storageGB,
+        hasPublicIp: created.hasPublicIP,
+        hasLoadBalancer: created.hasLoadBalancer,
+        priceBreakdown: created.priceBreakdown ?? quoted.quote.breakdown,
       });
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      log.error('failed to create lease', {
-        error: errMsg,
-        payer: paymentInfo.payer,
-      });
-      return c.json({
-        error: 'lease_creation_failed',
-        message: errMsg,
-      }, 400);
+    } catch (error) {
+      const httpError = leaseErrorToHttpError(error);
+      return jsonWithStatus(c, { error: httpError.message, details: httpError.details }, httpError.status);
     }
-
-    return c.json({
-      leaseId,
-      resourceId,
-      status: 'pending',
-      expiresAt: expiresAt.toISOString(),
-      encryptedSshKey: encrypted.combined,
-      sshPublicKey: keyPair.publicKey.trim(),
-      paymentTxHash: paymentInfo.txHash,
-      statusUrl: `/lease/${resourceId}/${leaseId}/status`,
-      storageGb: storageGb,
-      hasPublicIp: hasPublicIp,
-      hasLoadBalancer: hasLoadBalancer,
-      priceBreakdown,
-    });
   }
-
-  // -------------------------------------------------------------------
-  // getLeaseStatus: GET /lease/:resourceId/:leaseId/status
-  // -------------------------------------------------------------------
 
   async function getLeaseStatus(c: Context): Promise<Response> {
     const resourceId = c.req.param('resourceId') ?? '';
     const leaseId = c.req.param('leaseId') ?? '';
-
-    // Require wallet signature for ownership verification
-    const payerAddress = await requireAddressOwnership(c);
-    if (!payerAddress) {
-      return c.json({
-        error: 'authentication_required',
-        message: 'X-Wallet-Address, X-Wallet-Signature, and X-Wallet-Message headers are required',
-      }, 401);
+    if (!resourceId || !leaseId) {
+      return c.json({ error: 'resource ID and lease ID are required' }, 400);
     }
 
-    let lease;
+    const payerAddress = await requireAddressOwnership(c, db);
+    if (!payerAddress) {
+      return c.res;
+    }
+
     try {
-      lease = await db
-        .selectFrom('leases')
-        .selectAll()
-        .where('id', '=', leaseId)
-        .executeTakeFirst();
-    } catch (err) {
+      const status = await getLeaseService().getLeaseStatus(
+        resourceId,
+        leaseId,
+        payerAddress,
+      );
+      if (!status) {
+        return c.json({ error: 'lease_not_found', message: 'Lease not found' }, 404);
+      }
+
+      return c.json(status);
+    } catch (error) {
       log.error('failed to get lease status', {
-        error: err instanceof Error ? err.message : String(err),
+        leaseId,
+        error: error instanceof Error ? error.message : String(error),
       });
       return c.json({ error: 'failed to get lease status' }, 500);
     }
-
-    if (!lease) {
-      return c.json({ error: 'lease_not_found', message: 'Lease not found' }, 404);
-    }
-
-    // Verify resource ID matches
-    if (lease.resource_id !== resourceId) {
-      return c.json({ error: 'lease_not_found', message: 'Lease not found' }, 404);
-    }
-
-    // Verify payer matches (defense-in-depth against IDOR)
-    if (lease.payer_address.toLowerCase() !== payerAddress.toLowerCase()) {
-      return c.json({ error: 'lease_not_found', message: 'Lease not found' }, 404);
-    }
-
-    // Get the resource for SSH user info
-    let resource: LeaseResource | undefined;
-    try {
-      resource = await db
-        .selectFrom('lease_resources')
-        .selectAll()
-        .where('id', '=', lease.resource_id)
-        .executeTakeFirst();
-    } catch (err) {
-      log.error('failed to get resource for lease status', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-
-    // Build response
-    const expiresAt = new Date(lease.expires_at);
-    const resp: Record<string, unknown> = {
-      leaseId: lease.id,
-      resourceId: lease.resource_id,
-      status: lease.status,
-      sshPublicKey: lease.ssh_public_key,
-      expiresAt: expiresAt.toISOString(),
-      hasPublicIp: lease.has_public_ip,
-    };
-
-    if (lease.instance_id) resp.instanceId = lease.instance_id;
-    if (lease.public_ip) resp.publicIp = lease.public_ip;
-    if (resource) resp.sshUser = resource.ssh_user;
-
-    if (lease.status === 'running') {
-      const remainingMs = expiresAt.getTime() - Date.now();
-      resp.timeRemaining = formatTimeRemaining(remainingMs);
-
-      // Add expiry warning when close to expiration
-      const warningThresholdMs = config.leaseExpiryWarningMinutes * 60 * 1000;
-      if (warningThresholdMs > 0 && remainingMs > 0 && remainingMs < warningThresholdMs) {
-        resp.warningMessage = `Lease expires in ${formatTimeRemaining(remainingMs)}. Renew now to avoid termination.`;
-      }
-    }
-
-    if (lease.provisioned_at) {
-      resp.provisionedAt = new Date(lease.provisioned_at).toISOString();
-    }
-    if (lease.error_message) resp.errorMessage = lease.error_message;
-    if (lease.storage_gb !== null) resp.storageGb = lease.storage_gb;
-    if (lease.egress_limit_gb !== null) resp.egressLimitGb = lease.egress_limit_gb;
-    if (lease.ingress_limit_gb !== null) resp.ingressLimitGb = lease.ingress_limit_gb;
-    resp.egressUsedGb = lease.egress_used_gb;
-    resp.ingressUsedGb = lease.ingress_used_gb;
-
-    // Parse price breakdown from JSONB
-    if (lease.price_breakdown) {
-      try {
-        resp.priceBreakdown = typeof lease.price_breakdown === 'string'
-          ? JSON.parse(lease.price_breakdown)
-          : lease.price_breakdown;
-      } catch {
-        // ignore parse errors
-      }
-    }
-
-    return c.json(resp);
   }
 
-  // -------------------------------------------------------------------
-  // getRenewalAmount: calculate the payment amount for a lease renewal
-  // (used as the getAmount callback for payment middleware)
-  // -------------------------------------------------------------------
-
-  function getRenewalAmount(_c: Context): bigint {
-    // Synchronous -- same limitation as getLeaseAmount.
-    // The actual validation happens in renewLease.
-    return -1n;
+  async function getRenewalAmount(c: Context): Promise<bigint> {
+    const { quote } = await quoteRenewalRequest(c);
+    return quote.totalAtomic;
   }
-
-  // -------------------------------------------------------------------
-  // getRenewalDescription: description for renewal payment middleware
-  // -------------------------------------------------------------------
 
   function getRenewalDescription(c: Context): string {
     const resourceId = c.req.param('resourceId') ?? '';
@@ -596,17 +455,15 @@ export function createLeaseHandlers(deps: LeaseDeps) {
     return `EC2 lease renewal: ${resourceId} for ${duration} days`;
   }
 
-  // -------------------------------------------------------------------
-  // renewLease: PATCH /lease/:resourceId/:leaseId/renew
-  // -------------------------------------------------------------------
-
   async function renewLease(c: Context): Promise<Response> {
-    const resourceId = c.req.param('resourceId') ?? '';
-    const leaseId = c.req.param('leaseId') ?? '';
-    const durationStr = c.req.query('duration');
-    const { days, error: durationError } = parseDuration(durationStr);
-    if (durationError) {
-      return c.json({ error: 'invalid_duration', message: durationError }, 400);
+    let quoted: Awaited<ReturnType<typeof quoteRenewalRequest>>;
+    try {
+      quoted = await quoteRenewalRequest(c);
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return jsonWithStatus(c, { error: error.message, details: error.details }, error.status);
+      }
+      throw error;
     }
 
     const paymentInfo = getPaymentInfo(c);
@@ -614,101 +471,44 @@ export function createLeaseHandlers(deps: LeaseDeps) {
       return c.json({ error: 'payment info missing' }, 500);
     }
 
-    // Get and validate the lease
-    let lease;
-    try {
-      lease = await db
-        .selectFrom('leases')
-        .selectAll()
-        .where('id', '=', leaseId)
-        .executeTakeFirst();
-    } catch (err) {
-      log.error('failed to get lease for renewal', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return c.json({ error: 'renewal_failed', message: 'failed to get lease' }, 400);
-    }
-
-    if (!lease) {
-      return c.json({ error: 'renewal_failed', message: `lease not found: ${leaseId}` }, 400);
-    }
-
-    // Verify resource ID matches
-    if (lease.resource_id !== resourceId) {
-      return c.json({ error: 'renewal_failed', message: `lease not found: ${leaseId}` }, 400);
-    }
-
-    // Verify payer matches
-    if (lease.payer_address.toLowerCase() !== paymentInfo.payer.toLowerCase()) {
-      return c.json({ error: 'renewal_failed', message: 'unauthorized: payer address mismatch' }, 400);
-    }
-
-    // Must be running
-    if (lease.status !== 'running') {
+    if (paymentInfo.amount !== quoted.quote.totalAtomic) {
       return c.json({
-        error: 'renewal_failed',
-        message: `lease is not running (status: ${lease.status})`,
+        error: 'payment amount mismatch',
+        message: 'Lease renewal payment amount no longer matches the exact quoted price.',
       }, 400);
     }
 
-    // Compute new expiration
-    const currentExpiresAt = new Date(lease.expires_at);
-    const newExpiresAt = new Date(currentExpiresAt.getTime() + days * 24 * 60 * 60 * 1000);
-
-    // Update expiration and record additional payment
     try {
-      await db
-        .updateTable('leases')
-        .set({
-          expires_at: newExpiresAt.toISOString(),
-          amount_paid: lease.amount_paid + paymentInfo.amount,
-          duration_days: lease.duration_days + days,
-        })
-        .where('id', '=', leaseId)
-        .execute();
-    } catch (err) {
-      log.error('failed to renew lease', {
-        error: err instanceof Error ? err.message : String(err),
-        payer: paymentInfo.payer,
+      await getLeaseService().renewLease({
+        resourceId: quoted.resourceId,
+        leaseId: quoted.leaseId,
+        payerAddress: paymentInfo.payer,
+        durationDays: quoted.days,
+        amountPaid: paymentInfo.amount,
+        txHash: paymentInfo.txHash,
       });
-      return c.json({ error: 'renewal_failed', message: 'failed to update lease' }, 400);
+    } catch (error) {
+      const httpError = leaseErrorToHttpError(error);
+      return jsonWithStatus(c, { error: httpError.message, details: httpError.details }, httpError.status);
     }
 
-    // Return updated lease status
-    // Re-fetch the lease to get the updated values
-    try {
-      const updated = await db
-        .selectFrom('leases')
-        .selectAll()
-        .where('id', '=', leaseId)
-        .executeTakeFirst();
-
-      if (updated) {
-        const updatedExpires = new Date(updated.expires_at);
-        const remainingMs = updatedExpires.getTime() - Date.now();
-
-        return c.json({
-          leaseId: updated.id,
-          resourceId: updated.resource_id,
-          status: updated.status,
-          expiresAt: updatedExpires.toISOString(),
-          timeRemaining: formatTimeRemaining(remainingMs),
-          message: 'Lease renewed successfully',
-        });
-      }
-    } catch {
-      // fallback if re-fetch fails
+    const status = await getLeaseService().getLeaseStatus(
+      quoted.resourceId,
+      quoted.leaseId,
+      paymentInfo.payer,
+    );
+    if (!status) {
+      return c.json({
+        message: 'Lease renewed successfully',
+        leaseId: quoted.leaseId,
+      });
     }
 
     return c.json({
+      ...status,
       message: 'Lease renewed successfully',
-      leaseId,
     });
   }
-
-  // -------------------------------------------------------------------
-  // Return all handlers
-  // -------------------------------------------------------------------
 
   return {
     listResources,

@@ -18,6 +18,8 @@ import type { OFACChecker } from '../../ofac/checker.js';
 import { validateEthAddress } from '../../validation/index.js';
 import * as log from '../../logging/index.js';
 import * as metrics from '../../metrics/index.js';
+import { HttpError } from '../errors.js';
+import { jsonWithStatus } from '../response.js';
 
 // ---------------------------------------------------------------------------
 // Store interface (optional dependency for nonce tracking & budgets)
@@ -238,23 +240,49 @@ export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
    * @param getDescription - computes a human-readable description of the payment
    */
   function requirePayment(
-    getAmount: (c: Context) => bigint,
-    getDescription: (c: Context) => string,
+    getAmount: (c: Context) => bigint | Promise<bigint>,
+    getDescription: (c: Context) => string | Promise<string>,
   ): MiddlewareHandler {
     return async (c, next) => {
+      let amount: bigint;
+      let description: string;
+      try {
+        amount = await getAmount(c);
+        description = await getDescription(c);
+      } catch (err) {
+        if (err instanceof HttpError) {
+          const body: Record<string, unknown> = { error: err.message };
+          if (err.details !== undefined) {
+            body.details = err.details;
+          }
+          return jsonWithStatus(c, body, err.status);
+        }
+
+        log.error('failed to resolve payment requirements', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return c.json(
+          { error: 'unable to determine price for this resource' },
+          500,
+        );
+      }
+
+      if (amount <= 0n) {
+        log.error(
+          'payment amount is zero or negative -- refusing to create a free payment requirement',
+          { error: `amount=${amount}` },
+        );
+        return c.json(
+          { error: 'unable to determine price for this resource' },
+          400,
+        );
+      }
+
       // ------------------------------------------------------------------
       // 1. Budget flow: check X-Budget-Id header
       // ------------------------------------------------------------------
       const budgetId = c.req.header('X-Budget-Id');
       if (budgetId && store) {
-        const amount = getAmount(c);
-        if (amount <= 0n) {
-          return c.json(
-            { error: 'unable to determine price for this resource' },
-            400,
-          );
-        }
-
         // Extract function name for budget constraint checking
         const functionName = c.req.param('function') ?? '';
 
@@ -371,22 +399,6 @@ export function createPaymentMiddleware(deps: PaymentMiddlewareDeps) {
       // 2. Build resource URL
       // ------------------------------------------------------------------
       const resource = buildResourceURL(c, cfg);
-
-      // ------------------------------------------------------------------
-      // 3. Calculate amount
-      // ------------------------------------------------------------------
-      const amount = getAmount(c);
-      if (amount <= 0n) {
-        log.error(
-          'payment amount is zero or negative -- refusing to create a free payment requirement',
-          { error: `amount=${amount}` },
-        );
-        return c.json(
-          { error: 'unable to determine price for this resource' },
-          400,
-        );
-      }
-      const description = getDescription(c);
       const amountStr = amount.toString();
 
       // ------------------------------------------------------------------

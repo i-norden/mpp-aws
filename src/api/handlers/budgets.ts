@@ -17,7 +17,7 @@ import type { Kysely } from 'kysely';
 import type { Database } from '../../db/types.js';
 import type { Config } from '../../config/index.js';
 import { getPaymentInfo } from '../middleware/mpp.js';
-import { verifyAddressOwnership } from '../../auth/signature.js';
+import { verifyAddressOwnershipWithReplay } from '../../auth/signature.js';
 import {
   createBudget,
   getBudget,
@@ -25,6 +25,9 @@ import {
   revokeBudget,
 } from '../../db/store-budgets.js';
 import * as log from '../../logging/index.js';
+import { HttpError } from '../errors.js';
+import { readJsonBody } from '../request-body.js';
+import { jsonWithStatus } from '../response.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -36,6 +39,7 @@ export interface BudgetsDeps {
 }
 
 interface CreateBudgetRequest {
+  amount_atomic_usdc?: number | string;
   expires_in_hours?: number;
   allowed_functions?: string[];
   max_per_invocation?: number | string;
@@ -64,6 +68,7 @@ function formatUSD(atomicAmount: bigint): string {
  */
 async function requireAddressOwnership(
   c: Context,
+  db: Kysely<Database>,
 ): Promise<string | null> {
   const address = c.req.header('X-Wallet-Address') ?? '';
   const signature = c.req.header('X-Wallet-Signature') ?? c.req.header('X-Signature') ?? '';
@@ -78,12 +83,12 @@ async function requireAddressOwnership(
     return null;
   }
 
-  const result = await verifyAddressOwnership(signature, message, address);
+  const result = await verifyAddressOwnershipWithReplay(db, signature, message, address);
   if (!result.valid) {
-    c.res = c.json({
+    c.res = jsonWithStatus(c, {
       error: 'authentication failed',
       message: result.errorMessage,
-    }, 401) as unknown as Response;
+    }, result.statusCode ?? 401) as unknown as Response;
     return null;
   }
 
@@ -96,15 +101,44 @@ async function requireAddressOwnership(
 
 export function createBudgetsHandlers(deps: BudgetsDeps) {
   const { db, config } = deps;
+  const minimumBudgetAmount = 100_000n;
+
+  function parseRequestedBudgetAmount(req: CreateBudgetRequest): bigint {
+    if (req.amount_atomic_usdc === undefined || req.amount_atomic_usdc === null) {
+      throw new HttpError(400, 'amount_atomic_usdc is required');
+    }
+
+    let parsed: bigint;
+    try {
+      parsed = BigInt(req.amount_atomic_usdc);
+    } catch {
+      throw new HttpError(400, 'amount_atomic_usdc must be a whole-number atomic USDC value');
+    }
+
+    if (parsed < minimumBudgetAmount) {
+      throw new HttpError(
+        400,
+        `amount_atomic_usdc must be at least ${minimumBudgetAmount.toString()}`,
+      );
+    }
+
+    if (parsed > config.budgetMaxAmount) {
+      throw new HttpError(
+        400,
+        `amount_atomic_usdc must not exceed ${config.budgetMaxAmount.toString()}`,
+      );
+    }
+
+    return parsed;
+  }
 
   // -------------------------------------------------------------------
   // getBudgetAmount
   // -------------------------------------------------------------------
 
-  function getBudgetAmount(_c: Context): bigint {
-    // Minimum budget: $0.10 (100_000 atomic USDC)
-    // The actual budget balance is whatever the caller pays.
-    return 100_000n;
+  async function getBudgetAmount(c: Context): Promise<bigint> {
+    const req = await readJsonBody<CreateBudgetRequest>(c);
+    return parseRequestedBudgetAmount(req);
   }
 
   // -------------------------------------------------------------------
@@ -131,12 +165,24 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
       return c.json({ error: 'database not configured' }, 503);
     }
 
-    // 3. Parse request body (tolerate empty body)
-    let req: CreateBudgetRequest = {};
+    // 3. Parse request body
+    let req: CreateBudgetRequest;
     try {
-      req = await c.req.json() as CreateBudgetRequest;
-    } catch {
-      // Empty body or invalid JSON -- use defaults
+      req = (await readJsonBody<CreateBudgetRequest>(c, { allowEmpty: true })) ?? {};
+    } catch (err) {
+      if (err instanceof HttpError) {
+        return jsonWithStatus(c, { error: err.message, details: err.details }, err.status);
+      }
+      throw err;
+    }
+    let requestedAmount: bigint;
+    try {
+      requestedAmount = parseRequestedBudgetAmount(req);
+    } catch (err) {
+      if (err instanceof HttpError) {
+        return jsonWithStatus(c, { error: err.message }, err.status);
+      }
+      throw err;
     }
 
     let expiresInHours = req.expires_in_hours ?? 24;
@@ -150,16 +196,33 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
 
     const expiresAt = new Date(Date.now() + expiresInHours * 60 * 60 * 1000);
 
+    if (paymentInfo.amount !== requestedAmount) {
+      return c.json({
+        error: 'payment amount mismatch',
+        message: 'Budget payment amount no longer matches amount_atomic_usdc.',
+      }, 400);
+    }
+
     // Parse max_per_invocation
     let maxPerInvocation: bigint | null = null;
     if (req.max_per_invocation !== undefined && req.max_per_invocation !== null) {
       try {
         const parsed = BigInt(req.max_per_invocation);
-        if (parsed > 0n) {
-          maxPerInvocation = parsed;
+        if (parsed <= 0n) {
+          return c.json({
+            error: 'max_per_invocation must be greater than 0',
+          }, 400);
         }
+        if (parsed > requestedAmount) {
+          return c.json({
+            error: 'max_per_invocation must not exceed amount_atomic_usdc',
+          }, 400);
+        }
+        maxPerInvocation = parsed;
       } catch {
-        // Ignore invalid max_per_invocation
+        return c.json({
+          error: 'max_per_invocation must be a whole-number atomic USDC value',
+        }, 400);
       }
     }
 
@@ -168,8 +231,8 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
       const budgetRecord = await createBudget(db, {
         payerAddress: paymentInfo.payer,
         txHash: paymentInfo.txHash,
-        totalAmount: paymentInfo.amount,
-        remainingAmount: paymentInfo.amount,
+        totalAmount: requestedAmount,
+        remainingAmount: requestedAmount,
         expiresAt,
         allowedFunctions: req.allowed_functions?.length ? req.allowed_functions : null,
         maxPerInvocation,
@@ -177,11 +240,11 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
 
       return c.json({
         budgetId: budgetRecord.id,
-        totalAmount: Number(paymentInfo.amount),
-        remainingAmount: Number(paymentInfo.amount),
+        totalAmount: requestedAmount,
+        remainingAmount: requestedAmount,
         expiresAt: expiresAt.toISOString(),
         allowedFunctions: req.allowed_functions ?? null,
-        totalUSD: formatUSD(paymentInfo.amount),
+        totalUSD: formatUSD(requestedAmount),
       }, 201);
     } catch (err) {
       log.error('failed to create budget', {
@@ -223,7 +286,7 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
     }
 
     // Verify ownership
-    const verifiedAddr = await requireAddressOwnership(c);
+    const verifiedAddr = await requireAddressOwnership(c, db);
     if (!verifiedAddr) {
       return c.res;
     }
@@ -243,14 +306,13 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
   // -------------------------------------------------------------------
 
   async function handleListBudgets(c: Context): Promise<Response> {
-    // Verify ownership first (like the Go handler)
-    const verifiedAddr = await requireAddressOwnership(c);
-    if (!verifiedAddr) {
-      return c.res;
-    }
-
     if (!db) {
       return c.json({ error: 'database not configured' }, 503);
+    }
+
+    const verifiedAddr = await requireAddressOwnership(c, db);
+    if (!verifiedAddr) {
+      return c.res;
     }
 
     let limit = 50;
@@ -292,7 +354,7 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
     }
 
     // Verify ownership before revoking
-    const verifiedAddr = await requireAddressOwnership(c);
+    const verifiedAddr = await requireAddressOwnership(c, db);
     if (!verifiedAddr) {
       return c.res;
     }
@@ -335,7 +397,7 @@ export function createBudgetsHandlers(deps: BudgetsDeps) {
 
     return c.json({
       revoked: true,
-      remainingAmount: Number(revokedBudget.remaining_amount),
+      remainingAmount: BigInt(revokedBudget.remaining_amount),
       remainingUSD: formatUSD(BigInt(revokedBudget.remaining_amount)),
     }, 200);
   }

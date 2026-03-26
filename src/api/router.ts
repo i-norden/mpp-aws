@@ -416,7 +416,7 @@ export function createRouter(deps: RouterDeps): Hono {
     });
 
     const adminRateLimit = rateLimitMiddleware(adminLimiter, ipKeyFunc);
-    const adminAuth = adminAuthMiddleware(cfg.adminAPIKey, cfg.adminAddresses);
+    const adminAuth = adminAuthMiddleware(cfg.adminAPIKey, cfg.adminAddresses, deps.db);
 
     // Function management
     app.get('/admin/functions', adminRateLimit, adminAuth, adminHandlers.handleAdminListFunctions);

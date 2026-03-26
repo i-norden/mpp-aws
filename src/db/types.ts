@@ -162,6 +162,14 @@ export interface PaymentNonceTable {
   expires_at: Date | string;
 }
 
+export interface AuthNonceTable {
+  id: Generated<bigint>;
+  signer_address: string;
+  nonce: string;
+  created_at: CreatedAt;
+  expires_at: Date | string;
+}
+
 export interface FunctionAccessListTable {
   id: Generated<bigint>;
   function_name: string;
@@ -382,6 +390,7 @@ export interface Database {
   refunds: RefundTable;
   voucher_redemptions: VoucherRedemptionTable;
   payment_nonces: PaymentNonceTable;
+  auth_nonces: AuthNonceTable;
   function_access_list: FunctionAccessListTable;
   earnings: EarningTable;
   lease_resources: LeaseResourceTable;

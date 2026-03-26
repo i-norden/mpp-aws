@@ -15,7 +15,10 @@ import type { Config } from '../../config/index.js';
 import type { PricingEngine } from '../../pricing/engine.js';
 import { getPaymentInfo } from '../middleware/mpp.js';
 import { validateEthAddress } from '../../validation/index.js';
-import { isSSRFBlocked } from '../../lambda/invoker.js';
+import {
+  performPinnedHttpsRequest,
+  resolvePublicHostname,
+} from '../../net/pinned-https.js';
 import * as log from '../../logging/index.js';
 import type { OFACChecker } from '../../ofac/checker.js';
 import type { Selectable, Insertable } from 'kysely';
@@ -178,13 +181,6 @@ async function validateEndpointURL(
     }
   }
 
-  // DNS-rebinding protection: resolve hostname and check for private IPs
-  const blocked = await isSSRFBlocked(hostname);
-  if (blocked) {
-    return { valid: false, error: 'hostname resolves to a private/reserved IP address' };
-  }
-
-  // Port validation
   if (parsed.port) {
     const portNum = parseInt(parsed.port, 10);
     if (Number.isNaN(portNum) || portNum < 1 || portNum > 65535) {
@@ -192,7 +188,15 @@ async function validateEndpointURL(
     }
   }
 
-  return { valid: true };
+  try {
+    const addresses = await resolvePublicHostname(hostname);
+    return { valid: true, resolvedIP: addresses[0] };
+  } catch (err) {
+    return {
+      valid: false,
+      error: err instanceof Error ? err.message : 'hostname resolves to a private/reserved IP address',
+    };
+  }
 }
 
 /**
@@ -203,29 +207,36 @@ async function verifyEndpoint(
   endpoint: string,
   timeoutSeconds: number,
 ): Promise<{ reachable: boolean; authRequired: boolean; error?: string }> {
-  const timeout = Math.min(Math.max(timeoutSeconds, 1), 30);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout * 1000);
-
   try {
-    const resp = await fetch(endpoint, {
+    let resp = await performPinnedHttpsRequest(endpoint, {
       method: 'HEAD',
-      signal: controller.signal,
+      timeoutSeconds,
+      maxResponseBytes: 1024,
     });
 
-    if (resp.status === 401 || resp.status === 403) {
+    if (resp.statusCode === 405 || resp.statusCode === 501) {
+      resp = await performPinnedHttpsRequest(endpoint, {
+        method: 'GET',
+        timeoutSeconds,
+        maxResponseBytes: 16 * 1024,
+      });
+    }
+
+    if (resp.statusCode === 401 || resp.statusCode === 403) {
       return { reachable: true, authRequired: true };
     }
 
-    if (resp.status >= 500) {
+    if (resp.statusCode >= 500) {
       return { reachable: false, authRequired: false, error: 'endpoint returned server error' };
     }
 
     return { reachable: true, authRequired: false };
-  } catch {
-    return { reachable: false, authRequired: false, error: 'endpoint unreachable' };
-  } finally {
-    clearTimeout(timer);
+  } catch (err) {
+    return {
+      reachable: false,
+      authRequired: false,
+      error: err instanceof Error ? err.message : 'endpoint unreachable',
+    };
   }
 }
 

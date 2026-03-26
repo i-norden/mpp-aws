@@ -18,6 +18,7 @@ export interface CreditBalance {
   availableBalance: bigint;
   totalCredits: bigint;
   totalRedeemed: bigint;
+  creditCount: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -54,6 +55,7 @@ export async function getCreditBalance(
       sql<bigint>`COALESCE(SUM(CASE WHEN withdrawal_status = 'withdrawn' THEN amount ELSE 0 END), 0)`.as(
         "total_redeemed",
       ),
+      sql<bigint>`COUNT(*)`.as('credit_count'),
     ])
     .where("payer_address", "=", payerAddress)
     .executeTakeFirstOrThrow();
@@ -62,6 +64,7 @@ export async function getCreditBalance(
     availableBalance: BigInt(row.available_balance),
     totalCredits: BigInt(row.total_credits),
     totalRedeemed: BigInt(row.total_redeemed),
+    creditCount: Number(row.credit_count),
   };
 }
 

@@ -17,10 +17,11 @@ import type { Database } from '../../db/types.js';
 import type { Config } from '../../config/index.js';
 import type { BillingService } from '../../billing/service.js';
 import type { OFACChecker } from '../../ofac/checker.js';
-import { verifyAddressOwnership } from '../../auth/signature.js';
+import { verifyAddressOwnershipWithReplay } from '../../auth/signature.js';
 import { validateEthAddress } from '../../validation/index.js';
 import { getCreditBalance } from '../../db/store-credits.js';
 import * as log from '../../logging/index.js';
+import { jsonWithStatus } from '../response.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -54,6 +55,7 @@ function formatUSD(atomicAmount: bigint): string {
  */
 async function verifyOwnership(
   c: Context,
+  db: Kysely<Database>,
   address: string,
 ): Promise<boolean> {
   const signature = c.req.header('X-Signature') ?? '';
@@ -68,12 +70,12 @@ async function verifyOwnership(
     return false;
   }
 
-  const result = await verifyAddressOwnership(signature, message, address);
+  const result = await verifyAddressOwnershipWithReplay(db, signature, message, address);
   if (!result.valid) {
-    c.res = c.json({
+    c.res = jsonWithStatus(c, {
       error: 'authentication failed',
       message: result.errorMessage,
-    }, 401) as unknown as Response;
+    }, result.statusCode ?? 401) as unknown as Response;
     return false;
   }
 
@@ -108,7 +110,7 @@ export function createCreditsHandlers(deps: CreditsDeps) {
 
     const address = rawAddress.toLowerCase();
 
-    if (!(await verifyOwnership(c, address))) {
+    if (!(await verifyOwnership(c, db, address))) {
       return c.res;
     }
 
@@ -117,11 +119,11 @@ export function createCreditsHandlers(deps: CreditsDeps) {
 
       return c.json({
         address,
-        availableBalance: Number(balance.availableBalance),
+        availableBalance: balance.availableBalance,
         availableUSD: formatUSD(balance.availableBalance),
-        totalCredited: Number(balance.totalCredits),
-        totalRedeemed: Number(balance.totalRedeemed),
-        creditCount: Number(balance.totalCredits),
+        totalCredited: balance.totalCredits,
+        totalRedeemed: balance.totalRedeemed,
+        creditCount: balance.creditCount,
       });
     } catch (err) {
       log.error('failed to get credit balance', {
@@ -153,7 +155,7 @@ export function createCreditsHandlers(deps: CreditsDeps) {
 
     const address = rawAddress.toLowerCase();
 
-    if (!(await verifyOwnership(c, address))) {
+    if (!(await verifyOwnership(c, db, address))) {
       return c.res;
     }
 
@@ -175,7 +177,7 @@ export function createCreditsHandlers(deps: CreditsDeps) {
 
       interface CreditEntry {
         id: number;
-        amount: number;
+        amount: bigint;
         amountUSD: string;
         reason: string;
         sourceTxHash?: string;
@@ -187,7 +189,7 @@ export function createCreditsHandlers(deps: CreditsDeps) {
       const entries: CreditEntry[] = credits.map((cr) => {
         const entry: CreditEntry = {
           id: Number(cr.id),
-          amount: Number(cr.amount),
+          amount: BigInt(cr.amount),
           amountUSD: formatUSD(BigInt(cr.amount)),
           reason: cr.reason,
           redeemed: cr.withdrawal_status !== 'available',
@@ -249,7 +251,7 @@ export function createCreditsHandlers(deps: CreditsDeps) {
       }, 403);
     }
 
-    if (!(await verifyOwnership(c, address))) {
+    if (!(await verifyOwnership(c, db, address))) {
       return c.res;
     }
 
@@ -268,7 +270,7 @@ export function createCreditsHandlers(deps: CreditsDeps) {
     if (balance.availableBalance <= 0n) {
       return c.json({
         error: 'no credits available',
-        availableBalance: 0,
+        availableBalance: 0n,
       }, 400);
     }
 
@@ -276,9 +278,9 @@ export function createCreditsHandlers(deps: CreditsDeps) {
     if (balance.availableBalance < config.minRefundThreshold) {
       return c.json({
         error: 'credit balance below minimum redemption threshold',
-        availableBalance: Number(balance.availableBalance),
+        availableBalance: balance.availableBalance,
         availableUSD: formatUSD(balance.availableBalance),
-        minimumRequired: Number(config.minRefundThreshold),
+        minimumRequired: config.minRefundThreshold,
         minimumUSD: formatUSD(config.minRefundThreshold),
       }, 400);
     }
@@ -287,7 +289,7 @@ export function createCreditsHandlers(deps: CreditsDeps) {
     if (!billingService || !billingService.isRefundEnabled()) {
       return c.json({
         error: 'credit_redemption_unavailable',
-        availableBalance: Number(balance.availableBalance),
+        availableBalance: balance.availableBalance,
         availableUSD: formatUSD(balance.availableBalance),
         message: 'Credit redemption service is not configured. Please contact support for manual redemption or wait for service availability.',
         configHint: 'Set REFUND_ENABLED=true and configure REFUND_PRIVATE_KEY and RPC_URL to enable automatic redemption.',
@@ -313,21 +315,21 @@ export function createCreditsHandlers(deps: CreditsDeps) {
       return c.json({
         error: 'redemption_failed',
         message: result.error,
-        availableBalance: Number(result.availableBalance ?? 0n),
+        availableBalance: result.availableBalance ?? 0n,
         availableUSD: formatUSD(result.availableBalance ?? 0n),
       }, 400);
     }
 
     return c.json({
       success: true,
-      amountRedeemed: Number(result.amountRedeemed ?? 0n),
+      amountRedeemed: result.amountRedeemed ?? 0n,
       amountRedeemedUSD: formatUSD(result.amountRedeemed ?? 0n),
-      amountSent: Number(result.amountSent ?? 0n),
+      amountSent: result.amountSent ?? 0n,
       amountSentUSD: formatUSD(result.amountSent ?? 0n),
-      gasCost: Number(result.gasCost ?? 0n),
+      gasCost: result.gasCost ?? 0n,
       gasCostUSD: formatUSD(result.gasCost ?? 0n),
       txHash: result.txHash,
-      remainingBalance: Number(result.availableBalance ?? 0n),
+      remainingBalance: result.availableBalance ?? 0n,
     });
   }
 

@@ -3,6 +3,7 @@ import { sql } from 'kysely';
 import type { Database } from '../db/types.js';
 import type { BillingService } from '../billing/service.js';
 import type { Config } from '../config/index.js';
+import { cleanupExpiredAuthNonces } from '../db/store-auth-nonces.js';
 import { cleanupExpiredNonces } from '../db/store-nonces.js';
 import { expireBudgets } from '../db/store-budgets.js';
 import * as log from '../logging/index.js';
@@ -29,13 +30,19 @@ export class BackgroundWorkers {
       if (count > 0) log.debug('Cleaned up expired nonces', { count });
     });
 
-    // 2. Budget expiry - every 10 minutes
+    // 2. Auth nonce cleanup - every 5 minutes
+    this.addWorker('auth-nonce-cleanup', 5 * 60_000, async () => {
+      const count = await cleanupExpiredAuthNonces(db);
+      if (count > 0) log.debug('Cleaned up expired auth nonces', { count });
+    });
+
+    // 3. Budget expiry - every 10 minutes
     this.addWorker('budget-expiry', 10 * 60_000, async () => {
       const count = await expireBudgets(db);
       if (count > 0) log.info('Expired budgets', { count });
     });
 
-    // 3. Stuck refund recovery - every 3 minutes
+    // 4. Stuck refund recovery - every 3 minutes
     this.addWorker('stuck-refund-recovery', 3 * 60_000, async () => {
       const result = await sql`
         UPDATE refunds SET status = 'failed', error_message = 'auto-recovered: stuck in pending', completed_at = NOW()
@@ -48,11 +55,14 @@ export class BackgroundWorkers {
       }
     });
 
-    // 4. Orphaned redemption recovery - every 5 minutes
+    // 5. Orphaned redemption recovery - every 5 minutes
     this.addWorker('orphaned-redemption-recovery', 5 * 60_000, async () => {
       // Roll back credits stuck in pending > 15 min
       const creditResult = await sql`
-        UPDATE credits SET withdrawal_status = NULL
+        UPDATE credits
+        SET withdrawal_status = 'available',
+            redeemed_at = NULL,
+            redeemed_tx_hash = NULL
         WHERE withdrawal_status = 'pending' AND updated_at < NOW() - INTERVAL '15 minutes'
       `.execute(db);
       const creditCount = Number(creditResult.numAffectedRows ?? 0);
@@ -60,14 +70,17 @@ export class BackgroundWorkers {
 
       // Roll back earnings stuck in pending > 15 min
       const earningsResult = await sql`
-        UPDATE earnings SET withdrawal_status = NULL
+        UPDATE earnings
+        SET withdrawal_status = 'available',
+            withdrawn_at = NULL,
+            withdrawn_tx_hash = NULL
         WHERE withdrawal_status = 'pending' AND updated_at < NOW() - INTERVAL '15 minutes'
       `.execute(db);
       const earningsCount = Number(earningsResult.numAffectedRows ?? 0);
       if (earningsCount > 0) log.warn('Rolled back orphaned earnings withdrawals', { count: earningsCount });
     });
 
-    // 5. Wallet balance monitor - every 5 minutes
+    // 6. Wallet balance monitor - every 5 minutes
     if (this.deps.billingService?.isRefundEnabled()) {
       this.addWorker('wallet-balance-monitor', 5 * 60_000, async () => {
         const refundService = this.deps.billingService!.getRefundService();
@@ -83,7 +96,7 @@ export class BackgroundWorkers {
       });
     }
 
-    // 6. Data retention - every 24 hours (initial run after 30s)
+    // 7. Data retention - every 24 hours (initial run after 30s)
     const retentionFn = async () => {
       const result = await sql`
         DELETE FROM lambda_invocations WHERE created_at < NOW() - INTERVAL '90 days'
@@ -98,7 +111,7 @@ export class BackgroundWorkers {
     }, 30_000);
     this.addWorker('data-retention', 24 * 60 * 60_000, retentionFn);
 
-    // 7. Analytics refresh - every 5 minutes
+    // 8. Analytics refresh - every 5 minutes
     this.addWorker('analytics-refresh', 5 * 60_000, async () => {
       try {
         await sql`REFRESH MATERIALIZED VIEW CONCURRENTLY function_analytics_mv`.execute(db);
