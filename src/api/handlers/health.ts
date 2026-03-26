@@ -1,6 +1,7 @@
 import type { Context } from 'hono';
 import type { Kysely } from 'kysely';
 import type { Database } from '../../db/types.js';
+import { errorResponse, ErrorCodes } from '../errors.js';
 
 export function createHealthHandlers(db?: Kysely<Database>) {
   return {
@@ -24,7 +25,7 @@ export function createHealthHandlers(db?: Kysely<Database>) {
         const result = await db.selectFrom('pricing_config').select(db.fn.count('id').as('count')).executeTakeFirst();
         return c.json({ status: 'ok', database: 'connected', check: result });
       } catch (err) {
-        return c.json({ status: 'error', database: 'unreachable', error: String(err) }, 503);
+        return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database unreachable');
       }
     },
   };

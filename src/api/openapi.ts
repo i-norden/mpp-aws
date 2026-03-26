@@ -152,22 +152,69 @@ export function buildOpenAPISpec(cfg: Config): object {
     paths['/lease/{resourceId}/{leaseId}/renew'] = { patch: { summary: 'Renew lease (payment required)', tags: ['Lease'], responses: { '200': { description: 'Lease renewed' }, ...paymentResponses } } };
   }
 
-  // Admin (only documented if enabled)
-  paths['/admin/functions'] = { get: { summary: 'List all functions', tags: ['Admin'], security: [{ AdminApiKey: [] }] }, post: { summary: 'Register function', tags: ['Admin'] } };
-  paths['/admin/leases'] = { get: { summary: 'List all leases', tags: ['Admin'] } };
-  paths['/admin/billing/summary'] = { get: { summary: 'Billing summary', tags: ['Admin'] } };
-  paths['/admin/vouchers'] = { post: { summary: 'Create voucher', tags: ['Admin'] }, get: { summary: 'List vouchers', tags: ['Admin'] } };
-  paths['/admin/vouchers/{voucherId}'] = { delete: { summary: 'Revoke voucher', tags: ['Admin'] } };
-  paths['/admin/gdpr/delete'] = { post: { summary: 'GDPR right-to-erasure', tags: ['Admin'] } };
-  paths['/admin/retention/run'] = { post: { summary: 'Run data retention cleanup', tags: ['Admin'] } };
-  paths['/admin/monitoring/snapshot'] = { get: { summary: 'Metrics snapshot', tags: ['Admin'] } };
-  paths['/admin/monitoring/table-sizes'] = { get: { summary: 'Database table sizes', tags: ['Admin'] } };
-  paths['/admin/refunds/monitoring'] = { get: { summary: 'Pending/stuck refund monitoring', tags: ['Admin'] } };
-  paths['/admin/refunds/history'] = { get: { summary: 'Refund history by address', tags: ['Admin'] } };
-  paths['/admin/reconciliation/run'] = { post: { summary: 'Run on-chain reconciliation', tags: ['Admin'] } };
-  paths['/admin/reconciliation/latest'] = { get: { summary: 'Latest reconciliation report', tags: ['Admin'] } };
-  paths['/admin/wallet/balance'] = { get: { summary: 'Refund wallet balance', tags: ['Admin'] } };
-  paths['/admin/wallet/sweep'] = { post: { summary: 'Sweep wallet to treasury', tags: ['Admin'] } };
+  // Owner: cancel transfer
+  paths['/functions/{name}/transfer'] = {
+    ...paths['/functions/{name}/transfer'] as object,
+    delete: { summary: 'Cancel pending ownership transfer', tags: ['Owner'], responses: { '200': { description: 'Transfer cancelled' } } },
+  };
+
+  // Admin endpoints (all require API key or EIP-191 admin signature)
+  const adminSec = { security: [{ AdminApiKey: [] }, { EIP191Signature: [] }] };
+
+  // Function management
+  paths['/admin/functions'] = { get: { summary: 'List all functions', tags: ['Admin'], ...adminSec }, post: { summary: 'Register function', tags: ['Admin'], ...adminSec } };
+  paths['/admin/functions/{name}'] = { delete: { summary: 'Delete function', tags: ['Admin'], ...adminSec, parameters: [{ name: 'name', in: 'path', required: true, schema: { type: 'string' } }] } };
+  paths['/admin/stats/{function}'] = { get: { summary: 'Function invocation stats', tags: ['Admin'], ...adminSec } };
+
+  // Lease management
+  paths['/admin/leases'] = { get: { summary: 'List all leases', tags: ['Admin'], ...adminSec } };
+  paths['/admin/leases/summary'] = { get: { summary: 'Lease summary statistics', tags: ['Admin'], ...adminSec } };
+  paths['/admin/leases/{id}'] = { get: { summary: 'Get lease details', tags: ['Admin'], ...adminSec } };
+  paths['/admin/leases/{id}/terminate'] = { post: { summary: 'Terminate a lease', tags: ['Admin'], ...adminSec } };
+  paths['/admin/leases/{id}/extend'] = { post: { summary: 'Extend lease duration', tags: ['Admin'], ...adminSec } };
+  paths['/admin/leases/{id}/data'] = { delete: { summary: 'Delete lease data (GDPR)', tags: ['Admin'], ...adminSec } };
+
+  // Billing & financial
+  paths['/admin/billing/summary'] = { get: { summary: 'Billing summary', tags: ['Admin'], ...adminSec } };
+  paths['/admin/billing/invocations'] = { get: { summary: 'Invocation billing report', tags: ['Admin'], ...adminSec } };
+  paths['/admin/billing/refunds'] = { get: { summary: 'Refund billing report', tags: ['Admin'], ...adminSec } };
+  paths['/admin/billing/credits'] = { get: { summary: 'Credit billing report', tags: ['Admin'], ...adminSec } };
+  paths['/admin/billing/earnings'] = { get: { summary: 'Earnings billing report', tags: ['Admin'], ...adminSec } };
+
+  // Resource management
+  paths['/admin/resources'] = { get: { summary: 'List lease resources', tags: ['Admin'], ...adminSec }, post: { summary: 'Create lease resource', tags: ['Admin'], ...adminSec } };
+  paths['/admin/resources/{id}'] = { put: { summary: 'Update lease resource', tags: ['Admin'], ...adminSec }, delete: { summary: 'Delete lease resource', tags: ['Admin'], ...adminSec } };
+  paths['/admin/resources/{id}/utilization'] = { get: { summary: 'Resource utilization', tags: ['Admin'], ...adminSec } };
+
+  // Audit
+  paths['/admin/audit'] = { get: { summary: 'Query audit log', tags: ['Admin'], ...adminSec } };
+
+  // Voucher management
+  paths['/admin/vouchers'] = { post: { summary: 'Create voucher', tags: ['Admin'], ...adminSec }, get: { summary: 'List vouchers', tags: ['Admin'], ...adminSec } };
+  paths['/admin/vouchers/{voucherId}'] = { delete: { summary: 'Revoke voucher', tags: ['Admin'], ...adminSec } };
+
+  // Wallet operations
+  paths['/admin/wallet/balance'] = { get: { summary: 'Refund wallet balance', tags: ['Admin'], ...adminSec } };
+  paths['/admin/wallet/sweep'] = { post: { summary: 'Sweep wallet to treasury', tags: ['Admin'], ...adminSec } };
+  paths['/admin/wallet/collection/balance'] = { get: { summary: 'Collection wallet balance', tags: ['Admin'], ...adminSec } };
+  paths['/admin/wallet/collection/sweep'] = { post: { summary: 'Sweep collection wallet to treasury', tags: ['Admin'], ...adminSec } };
+
+  // Monitoring
+  paths['/admin/monitoring/snapshot'] = { get: { summary: 'Metrics snapshot (JSON)', tags: ['Admin'], ...adminSec } };
+  paths['/admin/monitoring/config'] = { get: { summary: 'Running configuration (no secrets)', tags: ['Admin'], ...adminSec } };
+  paths['/admin/monitoring/table-sizes'] = { get: { summary: 'Database table sizes', tags: ['Admin'], ...adminSec } };
+
+  // Reconciliation
+  paths['/admin/reconciliation/run'] = { post: { summary: 'Run on-chain payment reconciliation', tags: ['Admin'], ...adminSec } };
+  paths['/admin/reconciliation/latest'] = { get: { summary: 'Latest reconciliation report', tags: ['Admin'], ...adminSec } };
+
+  // Refund monitoring
+  paths['/admin/refunds/monitoring'] = { get: { summary: 'Pending and stuck refund monitoring', tags: ['Admin'], ...adminSec } };
+  paths['/admin/refunds/history'] = { get: { summary: 'Refund history by address', tags: ['Admin'], ...adminSec } };
+
+  // GDPR & Retention
+  paths['/admin/gdpr/delete'] = { post: { summary: 'GDPR right-to-erasure for an address', tags: ['Admin'], ...adminSec } };
+  paths['/admin/retention/run'] = { post: { summary: 'Manually trigger data retention cleanup', tags: ['Admin'], ...adminSec } };
 
   return {
     openapi: '3.0.3',
