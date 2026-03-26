@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { Challenge, Credential, PaymentRequest } from 'mppx';
 
 import type { Config } from '../../src/config/index.js';
+import { HttpError } from '../../src/api/errors.js';
 import { jsonSerializationMiddleware } from '../../src/api/middleware/json.js';
 import { createPaymentMiddleware } from '../../src/api/middleware/mpp.js';
 import { requestIdMiddleware } from '../../src/api/middleware/request-id.js';
@@ -176,6 +177,39 @@ describe('API middleware', () => {
     expect(challengeResponse.headers.get('www-authenticate')).toBeTruthy();
     // Should also have legacy X-PAYMENT header for backward compat
     expect(challengeResponse.headers.get('x-payment')).toBeTruthy();
+  });
+
+  it('supports async payment requirement callbacks and propagates HttpError responses', async () => {
+    const cfg = createTestConfig();
+    const mockMppServer = {
+      async chargeRequest(): Promise<ChargeResult> {
+        throw new Error('should not be called');
+      },
+    } as unknown as MPPServer;
+
+    const app = new Hono();
+    const { requirePayment } = createPaymentMiddleware({
+      cfg,
+      mppServer: mockMppServer,
+    });
+
+    app.post(
+      '/invoke/demo',
+      requirePayment(
+        async () => {
+          throw new HttpError(409, 'resource unavailable');
+        },
+        async () => 'demo charge',
+      ),
+      (c) => c.json({ ok: true }),
+    );
+
+    const response = await app.request('http://localhost/invoke/demo', {
+      method: 'POST',
+    });
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({ error: 'resource unavailable' });
   });
 
   it('returns 200 with Payment-Receipt when mppx verifies successfully', async () => {

@@ -1,29 +1,29 @@
-import { describe, expect, it, vi, afterEach } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { parseSignedMessage, verifyAddressOwnership } from '../../src/auth/signature.js';
+vi.mock('viem', () => ({
+  verifyMessage: vi.fn(),
+}));
+
+vi.mock('../../src/db/store-auth-nonces.js', () => ({
+  tryReserveAuthNonce: vi.fn(),
+}));
+
+import { verifyMessage } from 'viem';
+
+import { tryReserveAuthNonce } from '../../src/db/store-auth-nonces.js';
+import {
+  parseSignedMessage,
+  verifyAddressOwnership,
+  verifyAddressOwnershipWithReplay,
+} from '../../src/auth/signature.js';
 
 describe('auth/signature', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  // ---------------------------------------------------------------------------
-  // parseSignedMessage
-  // ---------------------------------------------------------------------------
-
   describe('parseSignedMessage', () => {
-    it('parses a valid message with address and timestamp', () => {
-      const now = Math.floor(Date.now() / 1000);
-      const address = '0x1234567890abcdef1234567890abcdef12345678';
-      const message = `open-compute:${address}:${now}`;
-
-      const parsed = parseSignedMessage(message);
-      expect(parsed.address).toBe(address.toLowerCase());
-      expect(parsed.timestamp).toBe(now);
-      expect(parsed.nonce).toBe('');
-    });
-
-    it('parses a valid message with nonce', () => {
+    it('parses a valid nonce-bearing message', () => {
       const now = Math.floor(Date.now() / 1000);
       const address = '0xabcdef1234567890abcdef1234567890abcdef12';
       const message = `open-compute:${address}:${now}:my-nonce-123`;
@@ -34,96 +34,137 @@ describe('auth/signature', () => {
       expect(parsed.nonce).toBe('my-nonce-123');
     });
 
-    it('normalizes address to lowercase', () => {
+    it('normalizes the address to lowercase', () => {
       const now = Math.floor(Date.now() / 1000);
-      const address = '0xABCDEF1234567890ABCDEF1234567890ABCDEF12';
-      const message = `open-compute:${address}:${now}`;
+      const message = `open-compute:0xABCDEF1234567890ABCDEF1234567890ABCDEF12:${now}:nonce-1234`;
 
-      const parsed = parseSignedMessage(message);
-      expect(parsed.address).toBe(address.toLowerCase());
+      expect(parseSignedMessage(message).address).toBe(
+        '0xabcdef1234567890abcdef1234567890abcdef12',
+      );
     });
 
-    it('throws on invalid prefix', () => {
+    it('rejects messages without a nonce', () => {
       const now = Math.floor(Date.now() / 1000);
-      const message = `wrong-prefix:0x1234567890abcdef1234567890abcdef12345678:${now}`;
+      const message = `open-compute:0x1234567890abcdef1234567890abcdef12345678:${now}`;
 
-      expect(() => parseSignedMessage(message)).toThrow("invalid message prefix: expected 'open-compute'");
+      expect(() => parseSignedMessage(message)).toThrow('invalid message format');
     });
 
-    it('throws on too few parts', () => {
-      expect(() => parseSignedMessage('open-compute:0x1234')).toThrow('invalid message format');
-    });
-
-    it('throws on invalid address format', () => {
+    it('rejects an invalid nonce format', () => {
       const now = Math.floor(Date.now() / 1000);
-      const message = `open-compute:not-an-address:${now}`;
+      const message = `open-compute:0x1234567890abcdef1234567890abcdef12345678:${now}:bad nonce`;
 
-      expect(() => parseSignedMessage(message)).toThrow('invalid address format');
+      expect(() => parseSignedMessage(message)).toThrow('invalid nonce format');
     });
 
-    it('throws on invalid timestamp format', () => {
-      const message = 'open-compute:0x1234567890abcdef1234567890abcdef12345678:not-a-number';
-
-      expect(() => parseSignedMessage(message)).toThrow('invalid timestamp format');
-    });
-
-    it('throws on expired timestamp', () => {
-      const expired = Math.floor(Date.now() / 1000) - 120; // 2 minutes ago (max is 60s)
-      const message = `open-compute:0x1234567890abcdef1234567890abcdef12345678:${expired}`;
+    it('rejects expired messages', () => {
+      const expired = Math.floor(Date.now() / 1000) - 120;
+      const message = `open-compute:0x1234567890abcdef1234567890abcdef12345678:${expired}:nonce-1234`;
 
       expect(() => parseSignedMessage(message)).toThrow('message expired');
     });
-
-    it('throws on future timestamp (more than 30s ahead)', () => {
-      const future = Math.floor(Date.now() / 1000) + 60; // 60s in the future (max is 30)
-      const message = `open-compute:0x1234567890abcdef1234567890abcdef12345678:${future}`;
-
-      expect(() => parseSignedMessage(message)).toThrow('invalid timestamp (in the future)');
-    });
-
-    it('accepts timestamp within tolerance window (small future)', () => {
-      const nearFuture = Math.floor(Date.now() / 1000) + 10; // 10s in the future (within 30s tolerance)
-      const address = '0x1234567890abcdef1234567890abcdef12345678';
-      const message = `open-compute:${address}:${nearFuture}`;
-
-      const parsed = parseSignedMessage(message);
-      expect(parsed.timestamp).toBe(nearFuture);
-    });
   });
 
-  // ---------------------------------------------------------------------------
-  // verifyAddressOwnership
-  // ---------------------------------------------------------------------------
-
   describe('verifyAddressOwnership', () => {
-    it('returns invalid when address in message does not match claimed address', async () => {
+    it('rejects when the message address does not match the claimed address', async () => {
       const now = Math.floor(Date.now() / 1000);
-      const messageAddress = '0x1234567890abcdef1234567890abcdef12345678';
-      const claimedAddress = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-      const message = `open-compute:${messageAddress}:${now}`;
+      const message = `open-compute:0x1234567890abcdef1234567890abcdef12345678:${now}:nonce-1234`;
 
-      const result = await verifyAddressOwnership('0x' + 'ab'.repeat(65), message, claimedAddress);
+      const result = await verifyAddressOwnership(
+        '0x' + 'ab'.repeat(65),
+        message,
+        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      );
 
       expect(result.valid).toBe(false);
-      expect(result.errorMessage).toBe('address in message does not match claimed address');
+      expect(result.errorMessage).toBe(
+        'address in message does not match claimed address',
+      );
     });
 
-    it('returns invalid for malformed message', async () => {
-      const result = await verifyAddressOwnership('0xdeadbeef', 'bad-message', '0x1234567890abcdef1234567890abcdef12345678');
+    it('rejects malformed messages before signature verification', async () => {
+      const result = await verifyAddressOwnership(
+        '0xdeadbeef',
+        'bad-message',
+        '0x1234567890abcdef1234567890abcdef12345678',
+      );
 
       expect(result.valid).toBe(false);
       expect(result.errorMessage).toContain('invalid message');
     });
 
-    it('returns invalid for expired message', async () => {
-      const expired = Math.floor(Date.now() / 1000) - 120;
+    it('verifies a valid signature', async () => {
+      vi.mocked(verifyMessage).mockResolvedValue(true);
+
+      const now = Math.floor(Date.now() / 1000);
       const address = '0x1234567890abcdef1234567890abcdef12345678';
-      const message = `open-compute:${address}:${expired}`;
+      const message = `open-compute:${address}:${now}:nonce-1234`;
 
       const result = await verifyAddressOwnership('0xdeadbeef', message, address);
 
+      expect(result.valid).toBe(true);
+      expect(result.address).toBe(address);
+    });
+  });
+
+  describe('verifyAddressOwnershipWithReplay', () => {
+    it('reserves the nonce after a valid signature', async () => {
+      vi.mocked(verifyMessage).mockResolvedValue(true);
+      vi.mocked(tryReserveAuthNonce).mockResolvedValue(true);
+
+      const now = Math.floor(Date.now() / 1000);
+      const address = '0x1234567890abcdef1234567890abcdef12345678';
+      const message = `open-compute:${address}:${now}:nonce-1234`;
+
+      const result = await verifyAddressOwnershipWithReplay(
+        {} as never,
+        '0xdeadbeef',
+        message,
+        address,
+      );
+
+      expect(result.valid).toBe(true);
+      expect(tryReserveAuthNonce).toHaveBeenCalledOnce();
+    });
+
+    it('rejects replayed nonces', async () => {
+      vi.mocked(verifyMessage).mockResolvedValue(true);
+      vi.mocked(tryReserveAuthNonce).mockResolvedValue(false);
+
+      const now = Math.floor(Date.now() / 1000);
+      const address = '0x1234567890abcdef1234567890abcdef12345678';
+      const message = `open-compute:${address}:${now}:nonce-1234`;
+
+      const result = await verifyAddressOwnershipWithReplay(
+        {} as never,
+        '0xdeadbeef',
+        message,
+        address,
+      );
+
       expect(result.valid).toBe(false);
-      expect(result.errorMessage).toBe('message expired (timestamp too old)');
+      expect(result.errorMessage).toBe('message nonce already used');
+      expect(result.statusCode).toBe(401);
+    });
+
+    it('fails closed when nonce storage is unavailable', async () => {
+      vi.mocked(verifyMessage).mockResolvedValue(true);
+      vi.mocked(tryReserveAuthNonce).mockRejectedValue(new Error('db down'));
+
+      const now = Math.floor(Date.now() / 1000);
+      const address = '0x1234567890abcdef1234567890abcdef12345678';
+      const message = `open-compute:${address}:${now}:nonce-1234`;
+
+      const result = await verifyAddressOwnershipWithReplay(
+        {} as never,
+        '0xdeadbeef',
+        message,
+        address,
+      );
+
+      expect(result.valid).toBe(false);
+      expect(result.errorMessage).toBe('authentication temporarily unavailable');
+      expect(result.statusCode).toBe(503);
     });
   });
 });

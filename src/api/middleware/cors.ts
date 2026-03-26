@@ -19,7 +19,7 @@ export function corsMiddleware(allowedOrigins: string[]): MiddlewareHandler {
       c.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
       c.header(
         'Access-Control-Allow-Headers',
-        'Origin, Content-Type, Authorization, X-PAYMENT, X-Wallet-Address, X-Wallet-Signature, X-Wallet-Message, X-Admin-Key, X-Signature, X-Message, X-Requested-With, X-Budget-Id, X-Request-Id',
+        'Origin, Content-Type, Authorization, X-PAYMENT, X-Wallet-Address, X-Wallet-Signature, X-Wallet-Message, X-Admin-Key, X-Admin-Address, X-Admin-Signature, X-Admin-Timestamp, X-Admin-Nonce, X-Signature, X-Message, X-Requested-With, X-Budget-Id, X-Request-Id',
       );
       c.header(
         'Access-Control-Expose-Headers',
