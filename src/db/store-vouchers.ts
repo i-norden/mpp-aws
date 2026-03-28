@@ -59,7 +59,7 @@ export async function createVoucherRedemption(
       amount: redemption.amount,
       issued_at: redemption.issuedAt,
       expires_at: redemption.expiresAt,
-      status: redemption.status ?? 'pending',
+      status: redemption.status ?? 'issued',
     })
     .returning('id')
     .executeTakeFirstOrThrow();
@@ -95,7 +95,7 @@ export async function tryCreateVoucherRedemption(
       amount: redemption.amount,
       issued_at: redemption.issuedAt,
       expires_at: redemption.expiresAt,
-      status: redemption.status ?? 'pending',
+      status: redemption.status ?? 'issued',
     })
     .onConflict((oc) => oc.column('voucher_id').doNothing())
     .returning('id')
@@ -122,9 +122,35 @@ export async function updateVoucherRedemptionStatus(
     .set({
       status,
       refund_tx_hash: refundTxHash || null,
+      redeemed_at: status === 'success' || status === 'failed' ? sql`NOW()` : null,
     })
     .where('voucher_id', '=', voucherId)
     .execute();
+}
+
+/**
+ * Atomically claim an issued voucher for a specific payer.
+ * Returns the claimed row, or null when the voucher is missing, expired, or not claimable.
+ */
+export async function claimVoucherRedemption(
+  db: Kysely<Database>,
+  voucherId: string,
+  payerAddress: string,
+): Promise<VoucherRedemption | null> {
+  const row = await db
+    .updateTable('voucher_redemptions')
+    .set({
+      payer_address: payerAddress,
+      status: 'pending',
+      redeemed_at: null,
+    })
+    .where('voucher_id', '=', voucherId)
+    .where('status', '=', 'issued')
+    .where('expires_at', '>', sql<Date>`NOW()`)
+    .returningAll()
+    .executeTakeFirst();
+
+  return row ?? null;
 }
 
 /**
@@ -156,7 +182,7 @@ export async function listVoucherRedemptions(
     .selectFrom('voucher_redemptions')
     .selectAll()
     .where('status', '=', status)
-    .orderBy('redeemed_at', 'desc')
+    .orderBy(sql`COALESCE(redeemed_at, issued_at)`, 'desc')
     .limit(limit)
     .execute();
 }
@@ -170,7 +196,7 @@ export async function listExpiredVouchers(
 ): Promise<VoucherRedemption[]> {
   const rows = await sql<VoucherRedemption>`
     SELECT * FROM voucher_redemptions
-    WHERE status = 'pending' AND expires_at < NOW()
+    WHERE status IN ('issued', 'pending') AND expires_at < NOW()
     ORDER BY expires_at ASC
     LIMIT ${limit}
   `.execute(db);
@@ -187,8 +213,9 @@ export async function expireVouchers(
 ): Promise<number> {
   const result = await sql`
     UPDATE voucher_redemptions
-    SET status = 'failed'
-    WHERE status = 'pending' AND expires_at < NOW()
+    SET status = 'failed',
+        redeemed_at = NOW()
+    WHERE status IN ('issued', 'pending') AND expires_at < NOW()
   `.execute(db);
 
   return Number(result.numAffectedRows ?? 0);

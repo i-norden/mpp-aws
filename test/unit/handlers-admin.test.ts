@@ -3,6 +3,11 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { createAdminHandlers } from '../../src/api/handlers/admin.js';
 
+const mocks = vi.hoisted(() => ({
+  createVoucherRedemption: vi.fn(),
+  createAuditEntry: vi.fn(),
+}));
+
 vi.mock('../../src/logging/index.js', () => ({
   info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(),
 }));
@@ -15,6 +20,19 @@ vi.mock('prom-client', () => ({
     MetricType: { Gauge: 'gauge', Counter: 'counter', Histogram: 'histogram' },
   },
 }));
+vi.mock('../../src/db/store-vouchers.js', () => ({
+  createVoucherRedemption: mocks.createVoucherRedemption,
+  getVoucherRedemption: vi.fn(),
+  listVoucherRedemptions: vi.fn(),
+  updateVoucherRedemptionStatus: vi.fn(),
+}));
+vi.mock('../../src/db/store-admin.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/db/store-admin.js')>('../../src/db/store-admin.js');
+  return {
+    ...actual,
+    createAuditEntry: mocks.createAuditEntry,
+  };
+});
 
 describe('admin handlers', () => {
   it('GET /admin/billing/summary returns 503 when db is null', async () => {
@@ -81,5 +99,36 @@ describe('admin handlers', () => {
     expect(res.status).toBe(400);
     const body = await res.json() as Record<string, unknown>;
     expect(body.error).toBe('invalid_request');
+  });
+
+  it('POST /admin/vouchers creates vouchers in issued state', async () => {
+    mocks.createVoucherRedemption.mockResolvedValueOnce(1n);
+    mocks.createAuditEntry.mockResolvedValueOnce(undefined);
+
+    const handlers = createAdminHandlers({
+      db: {} as any,
+      config: { trustProxyHeaders: false } as any,
+      pricingEngine: {} as any,
+    });
+    const app = new Hono();
+    app.post('/admin/vouchers', handlers.handleAdminCreateVoucher);
+
+    const res = await app.request('/admin/vouchers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        voucher_id: 'promo-123',
+        amount: '5000',
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(mocks.createVoucherRedemption).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        voucherId: 'promo-123',
+        status: 'issued',
+      }),
+    );
   });
 });

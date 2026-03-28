@@ -19,7 +19,9 @@ import type { Database, LambdaFunctionTable } from '../../db/types.js';
 import type { Config } from '../../config/index.js';
 import type { PricingEngine } from '../../pricing/engine.js';
 import type { RefundService } from '../../refund/service.js';
+import { getClientIp } from '../../http/client-ip.js';
 import * as log from '../../logging/index.js';
+import { invalidateFunctionCache } from '../function-registry.js';
 
 import {
   listAllFunctions,
@@ -419,6 +421,8 @@ export function createAdminHandlers(deps: AdminDeps) {
         log.info('function registered (updated)', { function: req.functionName });
       }
 
+      invalidateFunctionCache(req.functionName);
+
       const status = created ? 201 : 200;
       const message = created
         ? 'function registered (created)'
@@ -473,6 +477,7 @@ export function createAdminHandlers(deps: AdminDeps) {
         .where('function_name', '=', functionName)
         .execute();
 
+      invalidateFunctionCache(functionName);
       log.info('admin_function_disabled', { function: functionName });
 
       return c.json({
@@ -1731,7 +1736,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       const result = await deleteAllDataForAddress(db, address);
 
       await createAuditEntry(db, {
-        admin_ip: c.req.header('X-Forwarded-For') ?? c.req.header('X-Real-IP') ?? 'unknown',
+        admin_ip: getClientIp(c, config.trustProxyHeaders),
         action: 'gdpr.delete_all_data',
         target_type: 'address',
         target_id: address,
@@ -1779,7 +1784,7 @@ export function createAdminHandlers(deps: AdminDeps) {
       const result = await runRetentionCleanup(db, retentionCfg);
 
       await createAuditEntry(db, {
-        admin_ip: c.req.header('X-Forwarded-For') ?? c.req.header('X-Real-IP') ?? 'unknown',
+        admin_ip: getClientIp(c, config.trustProxyHeaders),
         action: 'retention.manual_run',
         target_type: 'system',
         target_id: 'retention',
@@ -1833,11 +1838,11 @@ export function createAdminHandlers(deps: AdminDeps) {
         amount,
         issuedAt: new Date(),
         expiresAt,
-        status: 'pending',
+        status: 'issued',
       });
 
       await createAuditEntry(db, {
-        admin_ip: c.req.header('X-Forwarded-For') ?? 'unknown',
+        admin_ip: getClientIp(c, config.trustProxyHeaders),
         action: 'voucher.create',
         target_type: 'voucher',
         target_id: voucherId,
@@ -1854,7 +1859,7 @@ export function createAdminHandlers(deps: AdminDeps) {
   async function handleAdminListVouchers(c: Context): Promise<Response> {
     if (!db) return errorResponse(c, 503, ErrorCodes.SERVICE_UNAVAILABLE, 'database not configured');
 
-    const status = c.req.query('status') ?? 'pending';
+    const status = c.req.query('status') ?? 'issued';
     const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10) || 50, 500);
 
     try {
@@ -1879,7 +1884,7 @@ export function createAdminHandlers(deps: AdminDeps) {
     try {
       await updateVoucherRedemptionStatus(db, voucherId, 'failed');
       await createAuditEntry(db, {
-        admin_ip: c.req.header('X-Forwarded-For') ?? 'unknown',
+        admin_ip: getClientIp(c, config.trustProxyHeaders),
         action: 'voucher.revoke',
         target_type: 'voucher',
         target_id: voucherId,
