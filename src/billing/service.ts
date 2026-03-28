@@ -247,6 +247,18 @@ export class BillingService {
       input.billedDurationMs,
     );
 
+    await this.processCalculatedBilling(input);
+  }
+
+  /**
+   * Processes refund and credit side effects for a pre-calculated billing breakdown.
+   * Callers are responsible for populating `input.breakdown` before invoking this path.
+   */
+  async processCalculatedBilling(input: InvocationBilling): Promise<void> {
+    if (!input.breakdown) {
+      throw new Error('breakdown must be calculated before processing billing');
+    }
+
     // If refunds not enabled or no refund due, we're done
     if (!this.cfg.refundEnabled || input.breakdown.grossRefund <= 0n) {
       input.refundStatus = 'none';
@@ -294,42 +306,20 @@ export class BillingService {
       creditAmount: 0n,
     };
 
-    if (breakdown.grossRefund <= 0n || !this.cfg.refundEnabled) {
-      input.refundStatus = 'none';
-      return;
-    }
-
-    // Calculate net refund after gas
+    // Calculate net refund after gas.
     const refundConfig = this.pricingEngine.getRefundConfig();
     const gasCost = refundConfig.estimatedGasCost;
     const minThreshold = refundConfig.minRefundThreshold;
-    let netRefund = breakdown.grossRefund - gasCost;
-    if (netRefund < 0n) {
-      netRefund = 0n;
-    }
+    const netRefund = breakdown.grossRefund > gasCost
+      ? breakdown.grossRefund - gasCost
+      : 0n;
 
     input.breakdown.gasCost = gasCost;
     input.breakdown.netRefund = netRefund;
     input.breakdown.refundEligible = netRefund >= minThreshold;
-    input.breakdown.creditAmount = breakdown.grossRefund; // Full amount if credited
+    input.breakdown.creditAmount = breakdown.grossRefund > 0n ? breakdown.grossRefund : 0n;
 
-    if (input.breakdown.refundEligible && this.refundService !== null) {
-      return this.processRefund(input);
-    }
-
-    // Below threshold - credit the user
-    if (netRefund > 0n || breakdown.grossRefund > 0n) {
-      input.refundStatus = 'credited';
-      await this.creditUser(input, input.breakdown.creditAmount, 'below_threshold', '');
-    } else {
-      input.refundStatus = 'none';
-    }
-
-    // Get updated credit balance
-    if (this.store !== null) {
-      const balance = await this.store.getCreditBalance(input.payerAddress);
-      input.creditBalance = balance.availableBalance;
-    }
+    await this.processCalculatedBilling(input);
   }
 
   // -----------------------------------------------------------------------

@@ -23,26 +23,24 @@ import type { PricingEngine } from '../../pricing/engine.js';
 import type {
   BillingService,
   InvocationBilling,
-  MeteredBillingBreakdown,
 } from '../../billing/service.js';
 import type { LambdaInvoker, InvocationResult } from '../../lambda/invoker.js';
 import { CircuitBreaker } from '../../circuit-breaker/index.js';
 import { getPaymentInfo } from '../middleware/mpp.js';
-import type { PaymentInfo } from '../../mpp/types.js';
 import { normalizeEthAddress } from '../../validation/index.js';
-import { createInvocation } from '../../db/store-invocations.js';
 import * as log from '../../logging/index.js';
 import * as metrics from '../../metrics/index.js';
 import type { OFACChecker } from '../../ofac/checker.js';
 import { applyToRequest, decrypt } from '../../endpoint-auth/index.js';
 import { readJsonBody } from '../request-body.js';
-import { HttpError, errorResponse, ErrorCodes } from '../errors.js';
+import { HttpError, errorCodeForStatus, errorResponse, ErrorCodes } from '../errors.js';
 import {
   assertFunctionInvocationAccess,
   invalidateFunctionCache,
   resolveFunctionForRequest,
   type LambdaFunction,
 } from '../function-registry.js';
+import { isHTTPEndpoint, settleInvocation } from '../../invocation/settlement.js';
 
 export interface InvokeDeps {
   db: Kysely<Database> | null;
@@ -91,11 +89,6 @@ interface BillingDetails {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/** Check if a function ARN is an HTTPS endpoint URL. */
-function isHTTPEndpoint(arn: string): boolean {
-  return arn.startsWith('https://');
-}
 
 /**
  * Format atomic USDC (6 decimals) as a USD string.
@@ -218,7 +211,7 @@ export function createInvokeHandlers(deps: InvokeDeps) {
       exactAmount = resolved.amount;
     } catch (err) {
       if (err instanceof HttpError) {
-        return errorResponse(c, err.status, ErrorCodes.INTERNAL_ERROR, err.message, err.details);
+        return errorResponse(c, err.status, errorCodeForStatus(err.status), err.message, err.details);
       }
       throw err;
     }
@@ -256,7 +249,7 @@ export function createInvokeHandlers(deps: InvokeDeps) {
       req = await parseInvokeBody(c);
     } catch (err) {
       if (err instanceof HttpError) {
-        return errorResponse(c, err.status, ErrorCodes.INTERNAL_ERROR, err.message, err.details);
+        return errorResponse(c, err.status, errorCodeForStatus(err.status), err.message, err.details);
       }
       throw err;
     }
@@ -357,16 +350,28 @@ export function createInvokeHandlers(deps: InvokeDeps) {
     // 8. Process billing and log invocation (best-effort, don't fail the request)
     let billingDetails: BillingDetails | null = null;
     if (db) {
-      const isHTTP = dbFunction !== null && isHTTPEndpoint(dbFunction.function_arn);
-      billingDetails = await processInvocationBilling(
-        deps,
+      const settlement = await settleInvocation(
+        {
+          db,
+          config,
+          billingService: deps.billingService,
+        },
         functionName,
         dbFunction,
-        paymentInfo,
+        {
+          payerAddress: paymentInfo.payer,
+          txHash: paymentInfo.txHash,
+          amountPaid: paymentInfo.amount,
+          refundAddress,
+        },
         result,
-        isHTTP,
-        refundAddress,
       );
+      if (settlement.billingInput) {
+        billingDetails = billingDetailsFromBreakdown(settlement.billingInput);
+        if (billingDetails && refundAddress) {
+          billingDetails.refundAddress = refundAddress;
+        }
+      }
     }
 
     // 9. Build response body
@@ -398,385 +403,4 @@ export function createInvokeHandlers(deps: InvokeDeps) {
     /** Exposed for external cache invalidation (e.g., after registration). */
     invalidateFunctionCache,
   };
-}
-
-// ---------------------------------------------------------------------------
-// processInvocationBilling (mirrors Go's Handler.processInvocationBilling)
-// ---------------------------------------------------------------------------
-
-async function processInvocationBilling(
-  deps: InvokeDeps,
-  functionName: string,
-  dbFunction: LambdaFunction | null,
-  paymentInfo: PaymentInfo,
-  result: InvocationResult,
-  isHTTP: boolean,
-  refundAddress: string,
-): Promise<BillingDetails | null> {
-  const { db, config, billingService } = deps;
-  if (!db) return null;
-
-  // Metered HTTP billing path
-  if (isHTTP && billingService && dbFunction && dbFunction.pricing_model === 'metered') {
-    return processMeteredHTTPBilling(
-      deps,
-      functionName,
-      dbFunction,
-      paymentInfo,
-      result,
-      refundAddress,
-    );
-  }
-
-  // Full billing path: Lambda + billing enabled + duration data available
-  if (!isHTTP && billingService && dbFunction && result.billedDurationMs > 0) {
-    const billingInput: InvocationBilling = {
-      payerAddress: paymentInfo.payer,
-      sourceTxHash: paymentInfo.txHash,
-      amountPaid: paymentInfo.amount,
-      memoryMB: dbFunction.memory_mb,
-      billedDurationMs: BigInt(result.billedDurationMs),
-      refundAddress,
-      refundStatus: 'none',
-      creditBalance: 0n,
-    };
-
-    try {
-      await billingService.processInvocationBilling(billingInput);
-    } catch (err) {
-      log.error('billing processing failed, falling back to legacy path', {
-        function: functionName,
-        payer: paymentInfo.payer,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      // Fall through to legacy path below
-      return logLegacyInvocation(
-        db,
-        deps,
-        functionName,
-        dbFunction,
-        paymentInfo,
-        result,
-      );
-    }
-
-    // Log invocation with billing details
-    try {
-      const invId = await createInvocation(db, {
-        function_name: functionName,
-        payer_address: paymentInfo.payer,
-        amount_paid: paymentInfo.amount,
-        tx_hash: paymentInfo.txHash || null,
-        status_code: result.statusCode,
-        success: result.success,
-        duration_ms: BigInt(result.billedDurationMs),
-        billed_duration_ms: BigInt(result.billedDurationMs),
-        memory_mb: dbFunction.memory_mb,
-        actual_cloud_cost: billingInput.breakdown?.actualCloudCost ?? null,
-        fee_amount: billingInput.breakdown?.feeAmount ?? null,
-        refund_amount: billingInput.breakdown && billingInput.breakdown.grossRefund > 0n
-          ? billingInput.breakdown.netRefund
-          : null,
-        refund_status: billingInput.refundStatus || null,
-        refund_tx_hash: billingInput.refundTxHash ?? null,
-      });
-      void invId; // logged for debugging
-
-      // Credit owner earnings based on actual revenue kept
-      await creditOwnerEarningsBilling(
-        db,
-        config,
-        functionName,
-        dbFunction,
-        paymentInfo,
-        billingInput,
-      );
-    } catch (err) {
-      log.error('failed to log invocation with billing', {
-        function: functionName,
-        payer: paymentInfo.payer,
-        txHash: paymentInfo.txHash,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-
-    const bd = billingDetailsFromBreakdown(billingInput);
-    if (bd && refundAddress) {
-      bd.refundAddress = refundAddress;
-    }
-    return bd;
-  }
-
-  // Legacy path: no billing data
-  return logLegacyInvocation(db, deps, functionName, dbFunction, paymentInfo, result);
-}
-
-// ---------------------------------------------------------------------------
-// processMeteredHTTPBilling
-// ---------------------------------------------------------------------------
-
-async function processMeteredHTTPBilling(
-  deps: InvokeDeps,
-  functionName: string,
-  dbFunction: LambdaFunction,
-  paymentInfo: PaymentInfo,
-  result: InvocationResult,
-  refundAddress: string,
-): Promise<BillingDetails | null> {
-  const { db, config, billingService } = deps;
-  if (!db || !billingService) return null;
-
-  const customCostPerRequest = dbFunction.custom_base_fee;
-  if (customCostPerRequest === null || customCostPerRequest === undefined) {
-    log.warn('metered HTTP billing called without custom_base_fee configured', {
-      function: functionName,
-    });
-    return null;
-  }
-
-  // Parse X-Actual-Cost from upstream response
-  let actualCost = BigInt(customCostPerRequest);
-  let costParsed = false;
-
-  if (result.responseHeaders) {
-    const costStr = result.responseHeaders['X-Actual-Cost'];
-    if (costStr) {
-      try {
-        const parsed = BigInt(costStr);
-        if (parsed >= 0n) {
-          actualCost = parsed;
-          costParsed = true;
-        }
-      } catch {
-        log.warn('invalid X-Actual-Cost header from upstream, charging full amount', {
-          function: functionName,
-          value: costStr,
-        });
-      }
-    }
-  }
-
-  if (!costParsed) {
-    actualCost = BigInt(customCostPerRequest);
-  }
-
-  // Cap at the price ceiling
-  if (actualCost > BigInt(customCostPerRequest)) {
-    actualCost = BigInt(customCostPerRequest);
-  }
-
-  // Calculate billing breakdown
-  const marketplaceFeeBps = dbFunction.marketplace_fee_bps ?? config.marketplaceFeeBps;
-  const platformFee = actualCost * BigInt(marketplaceFeeBps) / 10000n;
-  const ownerEarning = actualCost - platformFee;
-  let grossRefund = paymentInfo.amount - actualCost;
-  if (grossRefund < 0n) {
-    grossRefund = 0n;
-  }
-
-  const billingInput: InvocationBilling = {
-    payerAddress: paymentInfo.payer,
-    sourceTxHash: paymentInfo.txHash,
-    amountPaid: paymentInfo.amount,
-    memoryMB: 0,
-    billedDurationMs: 0n,
-    refundAddress,
-    refundStatus: 'none',
-    creditBalance: 0n,
-  };
-
-  const breakdown: MeteredBillingBreakdown = {
-    actualCost,
-    platformFee,
-    ownerEarning,
-    grossRefund,
-  };
-
-  try {
-    await billingService.processHTTPEndpointBilling(billingInput, breakdown);
-  } catch (err) {
-    log.error('metered billing processing failed', {
-      function: functionName,
-      payer: paymentInfo.payer,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-
-  // Credit owner earnings
-  if (ownerEarning > 0n && dbFunction.owner_address && dbFunction.owner_address.trim() !== '') {
-    try {
-      await db.insertInto('earnings').values({
-        owner_address: dbFunction.owner_address,
-        function_name: functionName,
-        amount: ownerEarning,
-        source_tx_hash: paymentInfo.txHash || null,
-      }).execute();
-    } catch (err) {
-      log.error('failed to credit metered earnings to function owner', {
-        function: functionName,
-        owner: dbFunction.owner_address,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  // Log invocation with billing details
-  try {
-    await createInvocation(db, {
-      function_name: functionName,
-      payer_address: paymentInfo.payer,
-      amount_paid: paymentInfo.amount,
-      tx_hash: paymentInfo.txHash || null,
-      status_code: result.statusCode,
-      success: result.success,
-      duration_ms: 0n,
-      actual_cloud_cost: billingInput.breakdown?.actualCloudCost ?? null,
-      fee_amount: billingInput.breakdown?.feeAmount ?? null,
-      refund_amount: billingInput.breakdown && billingInput.breakdown.grossRefund > 0n
-        ? billingInput.breakdown.netRefund
-        : null,
-      refund_status: billingInput.refundStatus || null,
-      refund_tx_hash: billingInput.refundTxHash ?? null,
-    });
-  } catch (err) {
-    log.error('failed to log metered invocation with billing', {
-      function: functionName,
-      payer: paymentInfo.payer,
-      txHash: paymentInfo.txHash,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-
-  const bd = billingDetailsFromBreakdown(billingInput);
-  if (bd && refundAddress) {
-    bd.refundAddress = refundAddress;
-  }
-  return bd;
-}
-
-// ---------------------------------------------------------------------------
-// creditOwnerEarningsBilling (billing-aware path)
-// ---------------------------------------------------------------------------
-
-async function creditOwnerEarningsBilling(
-  db: Kysely<Database>,
-  config: Config,
-  functionName: string,
-  dbFunction: LambdaFunction | null,
-  paymentInfo: PaymentInfo,
-  billingInput: InvocationBilling,
-): Promise<void> {
-  if (!dbFunction || !dbFunction.owner_address || !billingInput.breakdown) {
-    return;
-  }
-
-  let ownerRevenue = billingInput.breakdown.actualCloudCost + billingInput.breakdown.feeAmount;
-  if (ownerRevenue > paymentInfo.amount) {
-    ownerRevenue = paymentInfo.amount; // safety cap
-  }
-
-  const marketplaceFeeBps = dbFunction.marketplace_fee_bps ?? config.marketplaceFeeBps;
-  const platformFee = ownerRevenue * BigInt(marketplaceFeeBps) / 10000n;
-  const ownerEarning = ownerRevenue - platformFee;
-  if (ownerEarning <= 0n) {
-    return;
-  }
-
-  try {
-    await db.insertInto('earnings').values({
-      owner_address: dbFunction.owner_address,
-      function_name: functionName,
-      amount: ownerEarning,
-      source_tx_hash: paymentInfo.txHash || null,
-    }).execute();
-  } catch (err) {
-    log.error('failed to credit earnings to function owner', {
-      function: functionName,
-      owner: dbFunction.owner_address,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// logLegacyInvocation (no billing data)
-// ---------------------------------------------------------------------------
-
-async function logLegacyInvocation(
-  db: Kysely<Database>,
-  deps: InvokeDeps,
-  functionName: string,
-  dbFunction: LambdaFunction | null,
-  paymentInfo: PaymentInfo,
-  result: InvocationResult,
-): Promise<null> {
-  try {
-    await createInvocation(db, {
-      function_name: functionName,
-      payer_address: paymentInfo.payer,
-      amount_paid: paymentInfo.amount,
-      tx_hash: paymentInfo.txHash || null,
-      status_code: result.statusCode,
-      success: result.success,
-      duration_ms: BigInt(result.billedDurationMs),
-    });
-  } catch (err) {
-    log.error('failed to log invocation', {
-      function: functionName,
-      payer: paymentInfo.payer,
-      txHash: paymentInfo.txHash,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-
-  // Credit earnings based on full payment amount (legacy behavior)
-  await creditOwnerEarningsLegacy(
-    db,
-    deps.config,
-    functionName,
-    dbFunction,
-    paymentInfo,
-    result,
-  );
-
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// creditOwnerEarningsLegacy (no billing data — uses full payment amount)
-// ---------------------------------------------------------------------------
-
-async function creditOwnerEarningsLegacy(
-  db: Kysely<Database>,
-  config: Config,
-  functionName: string,
-  dbFunction: LambdaFunction | null,
-  paymentInfo: PaymentInfo,
-  _result: InvocationResult,
-): Promise<void> {
-  if (!dbFunction || !dbFunction.owner_address) {
-    return;
-  }
-
-  const marketplaceFeeBps = dbFunction.marketplace_fee_bps ?? config.marketplaceFeeBps;
-  const feeAmount = paymentInfo.amount * BigInt(marketplaceFeeBps) / 10000n;
-  const ownerEarning = paymentInfo.amount - feeAmount;
-  if (ownerEarning <= 0n) {
-    return;
-  }
-
-  try {
-    await db.insertInto('earnings').values({
-      owner_address: dbFunction.owner_address,
-      function_name: functionName,
-      amount: ownerEarning,
-      source_tx_hash: paymentInfo.txHash || null,
-    }).execute();
-  } catch (err) {
-    log.error('failed to credit earnings to function owner', {
-      function: functionName,
-      owner: dbFunction.owner_address,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
 }

@@ -17,6 +17,30 @@ import type { Database, AsyncJobTable } from './types.js';
 /** A row returned from the async_jobs table. */
 export type AsyncJob = Selectable<AsyncJobTable>;
 
+function cloneJsonValue(value: unknown): unknown {
+  return JSON.parse(JSON.stringify(value ?? null));
+}
+
+function decodeJsonValue<T>(value: T): T {
+  if (typeof value !== 'string') {
+    return value;
+  }
+
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return value;
+  }
+}
+
+function normalizeAsyncJob(row: AsyncJob): AsyncJob {
+  return {
+    ...row,
+    input: decodeJsonValue(row.input),
+    result: row.result === null ? null : decodeJsonValue(row.result),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Query helpers
 // ---------------------------------------------------------------------------
@@ -41,7 +65,7 @@ export async function createAsyncJob(
       function_name: job.functionName,
       payer_address: job.payerAddress,
       tx_hash: job.txHash,
-      input: JSON.stringify(job.input ?? {}),
+      input: cloneJsonValue(job.input ?? {}),
       amount_paid: job.amountPaid,
       expires_at: job.expiresAt instanceof Date ? job.expiresAt.toISOString() : job.expiresAt,
     })
@@ -68,7 +92,7 @@ export async function getAsyncJob(
     .where('id', '=', jobId)
     .executeTakeFirst();
 
-  return row ?? null;
+  return row ? normalizeAsyncJob(row) : null;
 }
 
 /**
@@ -85,7 +109,8 @@ export async function listAsyncJobsByAddress(
     .where('payer_address', '=', payerAddress)
     .orderBy('created_at', 'desc')
     .limit(limit)
-    .execute();
+    .execute()
+    .then((rows) => rows.map(normalizeAsyncJob));
 }
 
 /**
@@ -120,7 +145,7 @@ export async function claimPendingAsyncJobs(
     RETURNING jobs.*
   `.execute(db);
 
-  return result.rows;
+  return result.rows.map(normalizeAsyncJob);
 }
 
 /**
@@ -156,7 +181,7 @@ export async function updateAsyncJobCompleted(
     .updateTable('async_jobs')
     .set({
       status: 'completed',
-      result: JSON.stringify(result),
+      result: cloneJsonValue(result),
       actual_cost: actualCost,
       completed_at: sql`NOW()`,
     })
