@@ -244,9 +244,10 @@ export interface ServerDeps {
 // createApp -- build the full Hono app with all routes and middleware
 // ---------------------------------------------------------------------------
 
-export function createApp(deps: ServerDeps): { app: Hono; workers: Workers; billingService?: BillingService } {
+export function createApp(deps: ServerDeps): { app: Hono; workers: Workers; billingService?: BillingService; appCleanup: () => void } {
   const { config: cfg, db } = deps;
   const workers: Workers = {};
+  const cleanupFns: Array<() => void> = [];
 
   // -----------------------------------------------------------------------
   // 1. MPP Client
@@ -298,9 +299,10 @@ export function createApp(deps: ServerDeps): { app: Hono; workers: Workers; bill
   );
   if (ofacChecker) {
     logger.info({ count: ofacChecker.count() }, 'OFAC checker loaded');
-    ofacChecker.startPeriodicReload(60 * 60 * 1000, (count) => {
+    const timer = ofacChecker.startPeriodicReload(60 * 60 * 1000, (count) => {
       logger.info({ count }, 'OFAC blocked addresses reloaded');
     });
+    cleanupFns.push(() => clearInterval(timer));
   }
 
   // -----------------------------------------------------------------------
@@ -436,9 +438,19 @@ export function createApp(deps: ServerDeps): { app: Hono; workers: Workers; bill
     ofacChecker,
   };
 
-  const app = createRouter(routerDeps);
+  const router = createRouter(routerDeps);
+  cleanupFns.push(router.close);
 
-  return { app, workers, billingService };
+  return {
+    app: router.app,
+    workers,
+    billingService,
+    appCleanup: () => {
+      for (const fn of cleanupFns) {
+        fn();
+      }
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +464,7 @@ export function startServer(
     workers?: Workers;
     billingService?: BillingService;
     db?: Kysely<Database>;
+    appCleanup?: () => void;
   },
 ) {
   const port = parseInt(config.port, 10);
@@ -504,6 +517,8 @@ export function startServer(
       opts.billingService.close();
       logger.info('Billing service closed');
     }
+
+    opts?.appCleanup?.();
 
     // Close servers
     mainServer.close(() => {

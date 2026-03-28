@@ -43,6 +43,7 @@ export interface Config {
 
   // Access Control
   enforceWhitelist: boolean;
+  trustProxyHeaders: boolean;
   adminAPIKey: string;
   adminAddresses: string[];
 
@@ -286,6 +287,7 @@ export function loadConfig(): Config {
 
     // Access Control
     enforceWhitelist: getEnvBool('ENFORCE_WHITELIST', false),
+    trustProxyHeaders: getEnvBool('TRUST_PROXY_HEADERS', false),
     adminAPIKey: getEnvOrEmpty('ADMIN_API_KEY'),
     adminAddresses: getEnvStringSlice('ADMIN_ADDRESSES', []),
 

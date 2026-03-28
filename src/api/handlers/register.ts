@@ -23,6 +23,7 @@ import * as log from '../../logging/index.js';
 import { errorResponse, ErrorCodes } from '../errors.js';
 import type { OFACChecker } from '../../ofac/checker.js';
 import type { Selectable, Insertable } from 'kysely';
+import { invalidateFunctionCache } from '../function-registry.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -503,6 +504,8 @@ export function createRegisterHandlers(deps: RegisterDeps) {
       });
       return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to register endpoint');
     }
+
+    invalidateFunctionCache(functionID);
 
     // If private and allowedInvokers provided, insert into access list
     if (visibility === 'private' && req.allowedInvokers && req.allowedInvokers.length > 0) {

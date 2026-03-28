@@ -21,8 +21,8 @@ import { verifyAddressOwnershipWithReplay } from '../../auth/signature.js';
 import { validateEthAddress } from '../../validation/index.js';
 import { getCreditBalance, listCredits, createCredit } from '../../db/store-credits.js';
 import {
+  claimVoucherRedemption,
   getVoucherRedemption,
-  tryCreateVoucherRedemption,
   updateVoucherRedemptionStatus,
 } from '../../db/store-vouchers.js';
 import * as log from '../../logging/index.js';
@@ -348,7 +348,6 @@ export function createCreditsHandlers(deps: CreditsDeps) {
       return errorResponse(c, 400, ErrorCodes.INVALID_REQUEST, 'voucher_id is required');
     }
 
-    // Check if voucher was already redeemed
     const existing = await getVoucherRedemption(db, voucherId);
     if (existing) {
       if (existing.status === 'success') {
@@ -357,27 +356,31 @@ export function createCreditsHandlers(deps: CreditsDeps) {
       if (existing.status === 'pending') {
         return errorResponse(c, 409, ErrorCodes.CONFLICT, 'voucher redemption already in progress');
       }
+      if (existing.status === 'failed') {
+        if (new Date(existing.expires_at) < new Date()) {
+          return errorResponse(c, 410, ErrorCodes.INVALID_REQUEST, 'voucher has expired');
+        }
+        return errorResponse(c, 409, ErrorCodes.CONFLICT, 'voucher is no longer redeemable');
+      }
     }
 
-    // Try to atomically create the redemption
-    const { created } = await tryCreateVoucherRedemption(db, {
-      voucherId,
-      source: 'api',
-      payerAddress: address,
-      amount: existing?.amount ?? 0n, // Amount from voucher system
-      issuedAt: new Date(),
-      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24h default
-      status: 'pending',
-    });
-
-    if (!created) {
-      return errorResponse(c, 409, ErrorCodes.CONFLICT, 'voucher already redeemed');
-    }
-
-    // Retrieve the redemption to get the full record
-    const redemption = await getVoucherRedemption(db, voucherId);
+    const redemption = await claimVoucherRedemption(db, voucherId, address);
     if (!redemption) {
-      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to process voucher');
+      const current = await getVoucherRedemption(db, voucherId);
+      if (!current) {
+        return errorResponse(c, 404, ErrorCodes.NOT_FOUND, 'voucher not found');
+      }
+      if (current.status === 'success') {
+        return errorResponse(c, 409, ErrorCodes.CONFLICT, 'voucher already redeemed');
+      }
+      if (current.status === 'pending') {
+        return errorResponse(c, 409, ErrorCodes.CONFLICT, 'voucher redemption already in progress');
+      }
+      if (new Date(current.expires_at) < new Date()) {
+        await updateVoucherRedemptionStatus(db, voucherId, 'failed');
+        return errorResponse(c, 410, ErrorCodes.INVALID_REQUEST, 'voucher has expired');
+      }
+      return errorResponse(c, 409, ErrorCodes.CONFLICT, 'voucher is no longer redeemable');
     }
 
     // Check expiry

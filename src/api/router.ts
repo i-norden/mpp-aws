@@ -36,7 +36,7 @@ import {
 import { createRateLimiter } from '../ratelimit/factory.js';
 
 // Error handling
-import { HttpError, ErrorCodes, errorResponse } from './errors.js';
+import { HttpError, ErrorCodes, errorCodeForStatus, errorResponse } from './errors.js';
 import * as log from '../logging/index.js';
 
 // Handlers
@@ -103,10 +103,11 @@ function openAPISpec(cfg: Config): object {
 // createRouter
 // ---------------------------------------------------------------------------
 
-export function createRouter(deps: RouterDeps): Hono {
+export function createRouter(deps: RouterDeps): { app: Hono; close: () => void } {
   const { config: cfg } = deps;
 
   const app = new Hono();
+  const limitersToClose: Array<{ stop: () => void }> = [];
 
   // =========================================================================
   // Global error handler — catches unhandled exceptions and returns a
@@ -115,7 +116,7 @@ export function createRouter(deps: RouterDeps): Hono {
 
   app.onError((err, c) => {
     if (err instanceof HttpError) {
-      return errorResponse(c, err.status, ErrorCodes.INVALID_REQUEST, err.message, err.details);
+      return errorResponse(c, err.status, errorCodeForStatus(err.status), err.message, err.details);
     }
     log.error('unhandled error', {
       error: err.message,
@@ -133,7 +134,7 @@ export function createRouter(deps: RouterDeps): Hono {
 
   app.use('*', requestIdMiddleware());
   app.use('*', jsonSerializationMiddleware());
-  app.use('*', requestLoggingMiddleware());
+  app.use('*', requestLoggingMiddleware(cfg.trustProxyHeaders));
   app.use('*', corsMiddleware(cfg.corsAllowedOrigins));
 
   // =========================================================================
@@ -147,16 +148,19 @@ export function createRouter(deps: RouterDeps): Hono {
     cfg.redisURL,
     'rl:global:',
   );
+  limitersToClose.push(globalLimiter);
 
   const perAddressLimiter = createRateLimiter(
     { rate: cfg.perAddressRateLimit, burst: cfg.perAddressRateBurst, cleanupIntervalMs: CLEANUP_INTERVAL_MS },
     cfg.redisURL,
     'rl:addr:',
   );
+  limitersToClose.push(perAddressLimiter);
+  const ipKey = ipKeyFunc(cfg.trustProxyHeaders);
 
-  const publicRateLimit = rateLimitMiddleware(globalLimiter, ipKeyFunc);
-  const creditRateLimit = rateLimitMiddleware(perAddressLimiter, addressKeyFunc);
-  const ownerRateLimit = rateLimitMiddleware(perAddressLimiter, addressKeyFunc);
+  const publicRateLimit = rateLimitMiddleware(globalLimiter, ipKey, ipKey);
+  const creditRateLimit = rateLimitMiddleware(perAddressLimiter, addressKeyFunc, ipKey);
+  const ownerRateLimit = rateLimitMiddleware(perAddressLimiter, addressKeyFunc, ipKey);
 
   // =========================================================================
   // Payment middleware
@@ -186,6 +190,7 @@ export function createRouter(deps: RouterDeps): Hono {
     db: deps.db,
     config: cfg,
     pricingEngine: deps.pricingEngine,
+    billingService: deps.billingService,
     lambdaInvoker: deps.lambdaInvoker,
   });
   const functionsHandlers = createFunctionsHandlers({
@@ -376,7 +381,8 @@ export function createRouter(deps: RouterDeps): Hono {
       cfg.redisURL,
       'rl:lease:',
     );
-    const leaseRateLimit = rateLimitMiddleware(leaseLimiter, ipKeyFunc);
+    limitersToClose.push(leaseLimiter);
+    const leaseRateLimit = rateLimitMiddleware(leaseLimiter, ipKey, ipKey);
 
     app.get('/lease/resources', leaseRateLimit, leaseHandlers.listResources);
     app.post(
@@ -404,6 +410,7 @@ export function createRouter(deps: RouterDeps): Hono {
       cfg.redisURL,
       'rl:admin:',
     );
+    limitersToClose.push(adminLimiter);
 
     const adminHandlers = createAdminHandlers({
       db: deps.db,
@@ -413,8 +420,8 @@ export function createRouter(deps: RouterDeps): Hono {
       collectionService: deps.collectionService ?? null,
     });
 
-    const adminRateLimit = rateLimitMiddleware(adminLimiter, ipKeyFunc);
-    const adminAuth = adminAuthMiddleware(cfg.adminAPIKey, cfg.adminAddresses, deps.db);
+    const adminRateLimit = rateLimitMiddleware(adminLimiter, ipKey, ipKey);
+    const adminAuth = adminAuthMiddleware(cfg.adminAPIKey, cfg.adminAddresses, cfg.trustProxyHeaders, deps.db);
 
     // Function management
     app.get('/admin/functions', adminRateLimit, adminAuth, adminHandlers.handleAdminListFunctions);
@@ -476,5 +483,11 @@ export function createRouter(deps: RouterDeps): Hono {
     app.get('/admin/refunds/history', adminRateLimit, adminAuth, adminHandlers.handleAdminRefundHistory);
   }
 
-  return app;
+  const cleanup = () => {
+    for (const limiter of limitersToClose) {
+      limiter.stop();
+    }
+  };
+
+  return { app, close: cleanup };
 }

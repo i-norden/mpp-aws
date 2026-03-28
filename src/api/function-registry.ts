@@ -156,6 +156,10 @@ export function invalidateFunctionCache(name: string): void {
   functionCache.delete(name);
 }
 
+export function invalidateAllFunctionCache(): void {
+  functionCache.clear();
+}
+
 function getCachedFunction(name: string): LambdaFunction | null {
   const cached = functionCache.get(name);
   if (cached && Date.now() < cached.expiresAt) {

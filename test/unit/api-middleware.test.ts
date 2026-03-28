@@ -31,6 +31,7 @@ function createTestConfig(): Config {
     endpointAuthKey: '',
     endpointVerifyTimeout: 5,
     enforceWhitelist: false,
+    trustProxyHeaders: false,
     estimatedGasCostUSD: 10n,
     durationRatePer100ms: 100n,
     feePercentage: 10n,

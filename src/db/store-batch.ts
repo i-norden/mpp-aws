@@ -64,18 +64,30 @@ export async function createBatchInvocation(
 export async function updateBatchInvocation(
   db: Kysely<Database>,
   batchId: string,
-  completed: number,
-  failed: number,
-  status: string,
+  update: {
+    completed: number;
+    failed: number;
+    status: string;
+    actualCloudCost?: bigint | null;
+    feeAmount?: bigint | null;
+    refundAmount?: bigint | null;
+    refundStatus?: string | null;
+    refundTxHash?: string | null;
+  },
 ): Promise<void> {
-  const isTerminal = status === 'completed' || status === 'partial_failure';
+  const isTerminal = update.status === 'completed' || update.status === 'partial_failure';
 
   await db
     .updateTable('batch_invocations')
     .set({
-      completed_items: completed,
-      failed_items: failed,
-      status,
+      completed_items: update.completed,
+      failed_items: update.failed,
+      status: update.status,
+      actual_cloud_cost: update.actualCloudCost,
+      fee_amount: update.feeAmount,
+      refund_amount: update.refundAmount,
+      refund_status: update.refundStatus,
+      refund_tx_hash: update.refundTxHash,
       ...(isTerminal ? { completed_at: sql`NOW()` } : {}),
     })
     .where('id', '=', batchId)

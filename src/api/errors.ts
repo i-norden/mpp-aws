@@ -1,5 +1,6 @@
 import type { Context } from 'hono';
 import type { StatusCode } from 'hono/utils/http-status';
+import { getRequestId } from './middleware/request-id.js';
 
 // ---------------------------------------------------------------------------
 // HttpError
@@ -38,6 +39,29 @@ export const ErrorCodes = {
 
 export type ErrorCode = typeof ErrorCodes[keyof typeof ErrorCodes];
 
+export function errorCodeForStatus(status: number): ErrorCode {
+  switch (status) {
+    case 400:
+    case 410:
+    case 422:
+      return ErrorCodes.INVALID_REQUEST;
+    case 401:
+      return ErrorCodes.AUTHENTICATION_FAILED;
+    case 403:
+      return ErrorCodes.FORBIDDEN;
+    case 404:
+      return ErrorCodes.NOT_FOUND;
+    case 409:
+      return ErrorCodes.CONFLICT;
+    case 429:
+      return ErrorCodes.RATE_LIMITED;
+    case 503:
+      return ErrorCodes.SERVICE_UNAVAILABLE;
+    default:
+      return ErrorCodes.INTERNAL_ERROR;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // errorResponse — standardised JSON error helper
 // ---------------------------------------------------------------------------
@@ -53,7 +77,7 @@ export function errorResponse(
   message: string,
   details?: unknown,
 ): Response {
-  const requestId = c.req.header('X-Request-Id') ?? '';
+  const requestId = getRequestId(c) ?? c.req.header('X-Request-Id') ?? '';
   const body: Record<string, unknown> = { error, message };
   if (requestId) body.requestId = requestId;
   if (details !== undefined) body.details = details;

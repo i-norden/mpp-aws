@@ -6,6 +6,7 @@ import {
   requestsTotal,
   requestDuration,
 } from '../../metrics/index.js';
+import { getClientIp } from '../../http/client-ip.js';
 import { getRequestId } from './request-id.js';
 
 const UUID_RE =
@@ -13,7 +14,7 @@ const UUID_RE =
 const ETH_ADDRESS_RE = /^0x[0-9a-f]{40}$/i;
 const LONG_TOKEN_RE = /^[A-Za-z0-9_-]{24,}$/;
 
-export function requestLoggingMiddleware(): MiddlewareHandler {
+export function requestLoggingMiddleware(trustProxyHeaders: boolean): MiddlewareHandler {
   return async (c, next) => {
     const startedAt = process.hrtime.bigint();
     activeConnections.inc();
@@ -32,10 +33,7 @@ export function requestLoggingMiddleware(): MiddlewareHandler {
     const path = normalizePathForMetrics(c.req.path);
     const status = thrown ? 500 : c.res.status;
     const requestId = getRequestId(c);
-    const clientIp =
-      c.req.header('X-Forwarded-For')?.split(',')[0]?.trim() ??
-      c.req.header('X-Real-IP') ??
-      'unknown';
+    const clientIp = getClientIp(c, trustProxyHeaders);
 
     requestsTotal.inc({ method, path, status: String(status) });
     requestDuration.observe({ method, path }, durationSeconds);

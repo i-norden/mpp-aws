@@ -11,7 +11,7 @@ import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import type { Config } from '../config/index.js';
 import type { LambdaInvoker, InvocationResult } from '../lambda/invoker.js';
-import type { BillingService, InvocationBilling } from '../billing/service.js';
+import type { BillingService } from '../billing/service.js';
 import {
   claimPendingAsyncJobs,
   updateAsyncJobCompleted,
@@ -21,11 +21,11 @@ import {
   type AsyncJob,
 } from '../db/store-jobs.js';
 import { getFunction } from '../db/store-functions.js';
-import { createInvocation } from '../db/store-invocations.js';
 import {
   applyToRequest,
   decrypt,
 } from '../endpoint-auth/index.js';
+import { settleInvocation, isHTTPEndpoint } from '../invocation/settlement.js';
 import * as log from '../logging/index.js';
 
 // ---------------------------------------------------------------------------
@@ -42,11 +42,6 @@ export interface AsyncJobWorkerDeps {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/** Check if a function ARN is an HTTPS endpoint URL. */
-function isHTTPEndpoint(arn: string): boolean {
-  return arn.startsWith('https://');
-}
 
 // ---------------------------------------------------------------------------
 // AsyncJobWorker
@@ -223,59 +218,34 @@ export class AsyncJobWorker {
       return;
     }
 
-    // 4. Process billing (if billing service and duration data are available)
+    // 4. Process billing, log the invocation, and credit owner earnings.
     let actualCost = 0n;
-    if (this.billingService && !isHTTPEndpoint(dbFunction.function_arn) && result.billedDurationMs > 0) {
-      try {
-        const billingInput: InvocationBilling = {
-          payerAddress: job.payer_address,
-          sourceTxHash: job.tx_hash,
-          amountPaid: BigInt(job.amount_paid),
-          memoryMB: result.memoryMB || dbFunction.memory_mb,
-          billedDurationMs: BigInt(result.billedDurationMs),
-          refundStatus: 'none',
-          creditBalance: 0n,
-        };
-
-        await this.billingService.processInvocationBilling(billingInput);
-
-        if (billingInput.breakdown) {
-          actualCost = billingInput.breakdown.actualCloudCost + billingInput.breakdown.feeAmount;
-        }
-      } catch (err) {
-        log.error('billing processing failed for async job', {
-          jobId,
-          functionName: job.function_name,
-          error: err instanceof Error ? err.message : String(err),
-        });
-        // Continue -- billing failure should not fail the job
-      }
-    }
-
-    // 5. Log the invocation
     try {
-      await createInvocation(this.db, {
-        function_name: job.function_name,
-        payer_address: job.payer_address,
-        amount_paid: BigInt(job.amount_paid),
-        tx_hash: job.tx_hash || null,
-        status_code: result.statusCode,
-        success: result.success,
-        duration_ms: BigInt(result.billedDurationMs || 0),
-        billed_duration_ms: BigInt(result.billedDurationMs || 0),
-        memory_mb: result.memoryMB || dbFunction.memory_mb,
-        actual_cloud_cost: actualCost > 0n ? actualCost : null,
-      });
+      const settlement = await settleInvocation(
+        {
+          db: this.db,
+          config: this.config,
+          billingService: this.billingService,
+        },
+        job.function_name,
+        dbFunction,
+        {
+          payerAddress: job.payer_address,
+          txHash: job.tx_hash,
+          amountPaid: BigInt(job.amount_paid),
+        },
+        result,
+      );
+      actualCost = settlement.actualCost;
     } catch (err) {
-      log.error('failed to log invocation for async job', {
+      log.error('settlement failed for async job', {
         jobId,
         functionName: job.function_name,
         error: err instanceof Error ? err.message : String(err),
       });
-      // Continue -- logging failure should not fail the job
     }
 
-    // 6. Mark as completed
+    // 5. Mark as completed
     let resultPayload: unknown;
     try {
       resultPayload = result.body ? JSON.parse(result.body) : null;

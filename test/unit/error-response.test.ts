@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
 
-import { HttpError, ErrorCodes, errorResponse } from '../../src/api/errors.js';
+import { HttpError, ErrorCodes, errorCodeForStatus, errorResponse } from '../../src/api/errors.js';
+import { requestIdMiddleware } from '../../src/api/middleware/request-id.js';
 
 describe('ErrorCodes', () => {
   it('has all expected error codes', () => {
@@ -103,5 +104,31 @@ describe('errorResponse', () => {
     const res = await app.request('/test');
     const body = await res.json() as Record<string, unknown>;
     expect(body.details).toBeUndefined();
+  });
+
+  it('uses middleware-generated requestId when no header is supplied', async () => {
+    const app = new Hono();
+    app.use('*', requestIdMiddleware());
+    app.get('/test', (c) => {
+      return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'boom');
+    });
+
+    const res = await app.request('/test');
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.requestId).toBeDefined();
+    expect(body.requestId).toBe(res.headers.get('x-request-id'));
+  });
+});
+
+describe('errorCodeForStatus', () => {
+  it('maps HTTP statuses to machine-readable error codes', () => {
+    expect(errorCodeForStatus(400)).toBe(ErrorCodes.INVALID_REQUEST);
+    expect(errorCodeForStatus(401)).toBe(ErrorCodes.AUTHENTICATION_FAILED);
+    expect(errorCodeForStatus(403)).toBe(ErrorCodes.FORBIDDEN);
+    expect(errorCodeForStatus(404)).toBe(ErrorCodes.NOT_FOUND);
+    expect(errorCodeForStatus(409)).toBe(ErrorCodes.CONFLICT);
+    expect(errorCodeForStatus(429)).toBe(ErrorCodes.RATE_LIMITED);
+    expect(errorCodeForStatus(503)).toBe(ErrorCodes.SERVICE_UNAVAILABLE);
+    expect(errorCodeForStatus(500)).toBe(ErrorCodes.INTERNAL_ERROR);
   });
 });

@@ -145,9 +145,9 @@ export interface VoucherRedemptionTable {
   amount: bigint;
   issued_at: Date | string;
   expires_at: Date | string;
-  redeemed_at: Timestamp;
+  redeemed_at: Timestamp | null;
   refund_tx_hash: string | null;
-  status: Generated<string>; // 'pending' | 'success' | 'failed'
+  status: Generated<string>; // 'issued' | 'pending' | 'success' | 'failed'
 }
 
 export interface PaymentNonceTable {
@@ -306,6 +306,11 @@ export interface BatchInvocationTable {
   failed_items: Generated<number>;
   status: Generated<string>; // 'running' | 'completed' | 'partial_failure'
   amount_paid: bigint;
+  actual_cloud_cost: bigint | null;
+  fee_amount: bigint | null;
+  refund_amount: bigint | null;
+  refund_status: string | null;
+  refund_tx_hash: string | null;
   created_at: CreatedAt;
   completed_at: Date | null;
 }

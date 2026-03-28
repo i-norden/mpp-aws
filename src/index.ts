@@ -35,7 +35,10 @@ async function main() {
 
     // Run migrations
     try {
-      await runMigrations(db);
+      const { error } = await runMigrations(db);
+      if (error) {
+        throw error;
+      }
       logger.info('Database migrations complete');
     } catch (err) {
       logger.fatal({ error: err }, 'Database migration failed');
@@ -46,10 +49,10 @@ async function main() {
   }
 
   // Create full app with all dependencies
-  const { app, workers, billingService } = createApp({ config, db });
+  const { app, workers, billingService, appCleanup } = createApp({ config, db });
 
   // Start servers and wire up graceful shutdown
-  startServer(app, config, { workers, billingService, db });
+  startServer(app, config, { workers, billingService, db, appCleanup });
 }
 
 main().catch((err) => {
