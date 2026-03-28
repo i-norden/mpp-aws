@@ -9,6 +9,7 @@
 import type { Context, MiddlewareHandler } from 'hono';
 import type { RateLimiter, RateLimitInfo } from './limiter.js';
 import type { PaymentInfo } from '../mpp/types.js';
+import { getClientIpKey } from '../http/client-ip.js';
 
 // ---------------------------------------------------------------------------
 // Key extractor type
@@ -31,13 +32,14 @@ export type KeyExtractor = (c: Context) => string;
 export function rateLimitMiddleware(
   limiter: RateLimiter,
   keyFn: KeyExtractor,
+  fallbackKeyFn: KeyExtractor = () => '',
 ): MiddlewareHandler {
   return async (c, next) => {
     let key = keyFn(c);
 
     // Primary key unavailable -- fall back to IP-based rate limiting.
     if (!key) {
-      key = ipKeyFunc(c);
+      key = fallbackKeyFn(c);
       if (!key) {
         await next();
         return;
@@ -79,20 +81,8 @@ function setRateLimitHeaders(c: Context, info: RateLimitInfo): void {
  * Extracts the client IP address from the request.
  * Checks common proxy headers before falling back to the remote address.
  */
-export function ipKeyFunc(c: Context): string {
-  // Hono's standard way of getting the connecting address.
-  // Check forwarding headers first (reverse proxy / load balancer).
-  const forwarded = c.req.header('X-Forwarded-For');
-  if (forwarded) {
-    const first = forwarded.split(',')[0].trim();
-    if (first) return first;
-  }
-  const realIp = c.req.header('X-Real-Ip');
-  if (realIp) return realIp.trim();
-
-  // Fallback: some runtimes expose the remote address via env or ConnInfo.
-  // Return empty string if nothing is available so the middleware can skip.
-  return '';
+export function ipKeyFunc(trustProxyHeaders: boolean): KeyExtractor {
+  return (c: Context): string => getClientIpKey(c, trustProxyHeaders);
 }
 
 /**

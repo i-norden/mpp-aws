@@ -23,6 +23,7 @@ export interface BackgroundWorkerDeps {
 
 export class BackgroundWorkers {
   private timers: ReturnType<typeof setInterval>[] = [];
+  private timeouts: ReturnType<typeof setTimeout>[] = [];
   private deps: BackgroundWorkerDeps;
 
   constructor(deps: BackgroundWorkerDeps) { this.deps = deps; }
@@ -185,9 +186,13 @@ export class BackgroundWorkers {
       // Also clean up old audit logs (not covered by retention engine)
       await sql`DELETE FROM admin_audit_log WHERE created_at < NOW() - INTERVAL '365 days'`.execute(db);
     };
-    setTimeout(() => {
+    const initialRetentionRun = setTimeout(() => {
       retentionFn().catch(e => log.error('Data retention initial run failed', { error: String(e) }));
     }, 30_000);
+    if (typeof initialRetentionRun === 'object' && 'unref' in initialRetentionRun) {
+      initialRetentionRun.unref();
+    }
+    this.timeouts.push(initialRetentionRun);
     this.addWorker('data-retention', 24 * 60 * 60_000, retentionFn);
 
     // 9. Analytics refresh - every 5 minutes
@@ -205,6 +210,8 @@ export class BackgroundWorkers {
   stop() {
     for (const t of this.timers) clearInterval(t);
     this.timers = [];
+    for (const t of this.timeouts) clearTimeout(t);
+    this.timeouts = [];
     log.info('Background workers stopped');
   }
 

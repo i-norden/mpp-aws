@@ -39,6 +39,7 @@ import {
 } from '../../endpoint-auth/index.js';
 import * as log from '../../logging/index.js';
 import { errorResponse, ErrorCodes } from '../errors.js';
+import { invalidateFunctionCache } from '../function-registry.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -468,6 +469,8 @@ export function createOwnerHandlers(deps: OwnerDeps) {
       return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to update function');
     }
 
+    invalidateFunctionCache(fn.function_name);
+
     return c.json({
       message: 'function updated',
       functionName: fn.function_name,
@@ -507,6 +510,8 @@ export function createOwnerHandlers(deps: OwnerDeps) {
       return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to disable function');
     }
 
+    invalidateFunctionCache(fn.function_name);
+
     return c.json({
       message: 'function disabled',
       functionName: fn.function_name,
@@ -544,6 +549,8 @@ export function createOwnerHandlers(deps: OwnerDeps) {
       });
       return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to enable function');
     }
+
+    invalidateFunctionCache(fn.function_name);
 
     return c.json({
       message: 'function enabled',
@@ -708,6 +715,8 @@ export function createOwnerHandlers(deps: OwnerDeps) {
       });
       return errorResponse(c, 500, ErrorCodes.INTERNAL_ERROR, 'failed to execute transfer');
     }
+
+    invalidateFunctionCache(functionName);
 
     return c.json({
       message: 'ownership transferred',

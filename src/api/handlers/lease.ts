@@ -17,7 +17,7 @@ import {
   ResourceLimitReachedError,
   UserLimitReachedError,
 } from '../../db/store-lease.js';
-import { HttpError, errorResponse, ErrorCodes } from '../errors.js';
+import { HttpError, errorCodeForStatus, errorResponse, ErrorCodes } from '../errors.js';
 import { getPaymentInfo } from '../middleware/mpp.js';
 import { readJsonBody } from '../request-body.js';
 import * as log from '../../logging/index.js';
@@ -346,7 +346,7 @@ export function createLeaseHandlers(deps: LeaseDeps) {
       quoted = await quoteLeaseRequest(c);
     } catch (error) {
       if (error instanceof HttpError) {
-        return errorResponse(c, error.status, ErrorCodes.INTERNAL_ERROR, error.message, error.details);
+        return errorResponse(c, error.status, errorCodeForStatus(error.status), error.message, error.details);
       }
       throw error;
     }
@@ -394,7 +394,7 @@ export function createLeaseHandlers(deps: LeaseDeps) {
       });
     } catch (error) {
       const httpError = leaseErrorToHttpError(error);
-      return errorResponse(c, httpError.status, ErrorCodes.INTERNAL_ERROR, httpError.message, httpError.details);
+      return errorResponse(c, httpError.status, errorCodeForStatus(httpError.status), httpError.message, httpError.details);
     }
   }
 
@@ -447,7 +447,7 @@ export function createLeaseHandlers(deps: LeaseDeps) {
       quoted = await quoteRenewalRequest(c);
     } catch (error) {
       if (error instanceof HttpError) {
-        return errorResponse(c, error.status, ErrorCodes.INTERNAL_ERROR, error.message, error.details);
+        return errorResponse(c, error.status, errorCodeForStatus(error.status), error.message, error.details);
       }
       throw error;
     }
